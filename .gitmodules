@@ -1,0 +1,3 @@
+[submodule "cloudscraper"]
+	path = cloudscraper
+	url = https://github.com/VeNoMouS/cloudscraper.git
