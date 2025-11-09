@@ -4,14 +4,16 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-> **Comprehensive unofficial API wrapper for Perplexity.ai with automated account generation, browser automation, and full async support.**
+> **Comprehensive API wrapper for Perplexity.ai with automated account generation, browser automation, and full async support.**
 
 ## ✨ Features
 
 - 🔥 **Synchronous & Asynchronous Clients** - Choose your preferred approach
+- 🛡️ **Cloudflare Bypass** - Automatic Cloudflare challenge solving via cloudscraper
 - 🤖 **Automated Account Generation** - Create accounts using Emailnator
 - 🌐 **Browser Automation** - Full Playwright integration for UI interaction
-- 🍪 **Cookie Management** - Extract from Chrome, Firefox, Edge
+- 🎭 **Headless Mode** - Run browser automation without GUI (perfect for servers)
+- 🍪 **Cookie Management** - Extract from Firefox, Edge, or use browser profiles
 - 💬 **Conversation Mode** - Multi-turn conversations with context
 - 📊 **Batch Processing** - Process multiple queries concurrently
 - 🎨 **CLI Interface** - Rich terminal interface with colors
@@ -24,9 +26,12 @@
 ### Installation
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/perplexity-ai-wrapper.git
+# Clone repository (with submodules for cloudscraper)
+git clone --recursive https://github.com/yourusername/perplexity-ai-wrapper.git
 cd perplexity-ai-wrapper
+
+# If you already cloned without --recursive, initialize submodules:
+git submodule update --init --recursive
 
 # Run installation script
 bash install.sh  # Linux/Mac
@@ -37,7 +42,10 @@ install.bat      # Windows
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-playwright install chromium
+playwright install firefox
+
+# Install cloudscraper from submodule (if not done automatically)
+cd cloudscraper && pip install -e . && cd ..
 ```
 
 ### Basic Usage
@@ -45,11 +53,28 @@ playwright install chromium
 ```python
 from src.core.client import PerplexityClient
 
-# Simple search
-client = PerplexityClient()
+# Simple search (automatic connection detection)
+client = PerplexityClient()  # Automatically tries to find cookies
 response = client.search("What is quantum computing?")
 print(response.answer)
 ```
+
+**Or use the CLI with automatic connection:**
+```bash
+# Automatically detects and uses cookies - no setup needed!
+perplexity search "What is quantum computing?"
+
+# Or specify a profile explicitly
+perplexity search "What is quantum computing?" --profile my_account
+```
+
+## 📖 Documentation
+
+- **[Usage Guide](docs/USAGE.md)** - Complete usage instructions for all commands
+- **[Headless Mode Guide](docs/HEADLESS_MODE.md)** - Run browser automation without GUI (servers, CI/CD)
+- **[Performance Optimizations](docs/PERFORMANCE_OPTIMIZATIONS.md)** - Phase 1 optimizations for speed and efficiency
+- **[Platform Setup](docs/PLATFORM_SETUP.md)** - Setup instructions for Windows PowerShell and Ubuntu/WSL2
+- **[API Status](docs/API_STATUS.md)** - Current API status, Cloudflare protection, and solutions
 
 ## 📚 Complete Examples
 
@@ -137,8 +162,8 @@ from src.auth.cookie_manager import CookieManager
 # Initialize manager
 cookie_manager = CookieManager()
 
-# Extract from Chrome
-cookies = cookie_manager.auto_extract(browser='chrome')
+# Extract from Firefox
+cookies = cookie_manager.auto_extract(browser='firefox')
 print(f"Extracted {len(cookies)} cookies")
 
 # Save to profile
@@ -182,7 +207,7 @@ client = PerplexityClient(cookies=account.cookies)
 ```python
 from src.automation.web_driver import PerplexityWebDriver
 
-# Initialize driver
+# Initialize driver (with visible browser)
 driver = PerplexityWebDriver(headless=False, stealth_mode=True)
 
 driver.start()
@@ -203,6 +228,27 @@ driver.interactive_mode()
 
 driver.close()
 ```
+
+**Or use headless mode (no browser window):**
+```python
+# Perfect for servers, CI/CD, background tasks
+driver = PerplexityWebDriver(headless=True, stealth_mode=True)
+driver.start()
+driver.navigate_to_perplexity()
+response = driver.search("your query", wait_for_response=True)
+driver.close()
+```
+
+**CLI headless mode:**
+```bash
+# Windows PowerShell
+.\perplexity.ps1 -Query "your query" -Mode browser -Headless -Profile fresh
+
+# Linux/Mac
+./perplexity.sh "your query" --mode browser --headless --profile fresh
+```
+
+See [Headless Mode Guide](docs/HEADLESS_MODE.md) for details.
 
 ### 8. Network Inspector (API Discovery)
 
@@ -255,7 +301,7 @@ perplexity conversation --profile my_account
 perplexity batch "Query 1" "Query 2" "Query 3" --output results.json
 
 # Cookie management
-perplexity cookies extract --browser chrome --profile my_profile
+perplexity cookies extract --browser firefox --profile my_profile
 perplexity cookies list
 perplexity cookies delete old_profile
 
@@ -263,7 +309,7 @@ perplexity cookies delete old_profile
 perplexity account generate --count 3 --emailnator-cookies cookies.json
 
 # Browser automation
-perplexity browser --user-data-dir "C:\Users\User\AppData\Local\Google\Chrome\User Data"
+perplexity browser --user-data-dir "C:\Users\User\AppData\Roaming\Mozilla\Firefox\Profiles\your_profile"
 ```
 
 ## 📖 API Documentation
@@ -333,7 +379,7 @@ logging:
 ```bash
 PERPLEXITY_BASE_URL=https://www.perplexity.ai
 PERPLEXITY_SESSION_TOKEN=your_token
-CHROME_USER_DATA_DIR=/path/to/chrome/profile
+FIREFOX_USER_DATA_DIR=/path/to/firefox/profile
 LOG_LEVEL=INFO
 ```
 
@@ -392,12 +438,12 @@ Contributions are welcome! Please follow these steps:
 
 ## ⚠️ Disclaimer
 
-This is an **unofficial** wrapper for Perplexity.ai. Use responsibly and in accordance with Perplexity's Terms of Service. The authors are not responsible for any misuse or violations.
+This is a wrapper for Perplexity.ai. Use responsibly and in accordance with Perplexity's Terms of Service. The authors are not responsible for any misuse or violations.
 
 ## 📋 Requirements
 
 - Python 3.8+
-- Chrome/Firefox/Edge (for cookie extraction)
+- Firefox/Camoufox (for browser automation)
 - Playwright (for browser automation)
 - Emailnator account (for account generation)
 
@@ -417,7 +463,7 @@ sudo apt-get install python3-dev libsqlite3-dev
 
 ```bash
 # Reinstall Playwright browsers
-playwright install --force chromium
+playwright install --force firefox
 
 # Check installation
 playwright --version

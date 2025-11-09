@@ -10,7 +10,11 @@ import re
 from typing import Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
 from .cookie_manager import CookieManager
-from ..core.models import AccountCredentials
+try:
+    from core.models import AccountCredentials
+except ImportError:
+    # Fallback for development mode
+    from src.core.models import AccountCredentials
 
 
 class EmailnatorClient:

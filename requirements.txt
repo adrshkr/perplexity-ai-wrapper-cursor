@@ -61,3 +61,14 @@ isort>=5.12.0
 websockets>=12.0  # For real-time streaming
 pillow>=10.1.0    # For image handling
 python-magic>=0.4.27  # For file type detection
+
+# Cloudflare Bypass (via cloudscraper submodule)
+# Note: cloudscraper is added as git submodule, but these are its dependencies
+js2py>=0.74  # JavaScript interpreter for Cloudflare challenges
+pycryptodome>=3.20.0  # Cryptographic functions
+brotli>=1.1.0  # Brotli compression support
+requests-toolbelt>=1.0.0  # Additional request utilities
+pyparsing>=3.1.0  # Parsing utilities
+pyOpenSSL>=24.0.0  # SSL/TLS support
+websocket-client>=1.7.0  # WebSocket support
+certifi>=2024.2.2  # SSL certificates

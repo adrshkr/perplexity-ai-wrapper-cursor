@@ -8,7 +8,7 @@ import json
 import sys
 import os
 import time
-from typing import Optional, Dict, Any
+from typing import Optional
 
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -16,8 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from src.core.client import PerplexityClient
 from src.core.async_client import AsyncPerplexityClient
 from src.core.models import SearchMode, AIModel, SourceType
-from src.auth.cookie_manager import CookieManager, SessionManager
-from src.auth.account_generator import AccountGenerator, EmailnatorClient
+from src.auth.cookie_manager import CookieManager
 from src.automation.web_driver import PerplexityWebDriver
 
 
@@ -94,9 +93,9 @@ class ConnectionManager:
                     try:
                         cookies = self.cookie_manager.load_cookies(profile)
                         if cookies:
-                            client = PerplexityClient(cookies=cookies)
+                            client = PerplexityClient(cookies=cookies, timeout=10)
                             # Test the connection
-                            test_response = client.search("test", timeout=10)
+                            client.search("test")
                             self.log_attempt(
                                 f"Existing profile '{profile}'", 
                                 True, 
@@ -133,8 +132,8 @@ class ConnectionManager:
                     profile_name = f"auto_{browser}"
                     self.cookie_manager.save_cookies(cookies, profile_name)
                     
-                    client = PerplexityClient(cookies=cookies)
-                    test_response = client.search("test", timeout=10)
+                    client = PerplexityClient(cookies=cookies, timeout=10)
+                    client.search("test")
                     
                     self.log_attempt(
                         f"Browser extraction ({browser})", 
@@ -166,8 +165,8 @@ class ConnectionManager:
                         cookies = json.load(f)
                     
                     if cookies:
-                        client = PerplexityClient(cookies=cookies)
-                        test_response = client.search("test", timeout=10)
+                        client = PerplexityClient(cookies=cookies, timeout=10)
+                        client.search("test")
                         
                         self.log_attempt(
                             f"Manual file '{file}'", 
@@ -207,8 +206,8 @@ class ConnectionManager:
                 with open('cookies.json', 'r') as f:
                     cookies = json.load(f)
                 
-                client = PerplexityClient(cookies=cookies)
-                test_response = client.search("test", timeout=10)
+                client = PerplexityClient(cookies=cookies, timeout=10)
+                client.search("test")
                 
                 self.log_attempt("Interactive setup", True, "Manual cookies loaded")
                 return client
@@ -232,21 +231,31 @@ class ConnectionManager:
             print("  Press Enter when you are logged in and ready to continue...")
             input()
             
-            # Extract cookies from automation
-            auto_cookies = driver.get_cookies()
-            if auto_cookies:
-                self.cookie_manager.save_cookies(auto_cookies, "automation_profile")
-                client = PerplexityClient(cookies=auto_cookies)
-                
-                self.log_attempt(
-                    "Web automation", 
-                    True, 
-                    f"Extracted {len(auto_cookies)} cookies via automation"
-                )
-                
-                driver.close()
-                return client
-                
+            # Extract cookies from browser context
+            # Note: For persistent contexts, cookies are automatically saved
+            # For non-persistent, we need to extract them from the context
+            if driver.context:
+                try:
+                    # Playwright requires URL parameter for cookies()
+                    cookies_list = driver.context.cookies(['https://www.perplexity.ai'])
+                    auto_cookies = {cookie['name']: cookie['value'] for cookie in cookies_list 
+                                  if 'perplexity.ai' in cookie.get('domain', '')}
+                    
+                    if auto_cookies:
+                        self.cookie_manager.save_cookies(auto_cookies, "automation_profile")
+                        client = PerplexityClient(cookies=auto_cookies)
+                        
+                        self.log_attempt(
+                            "Web automation", 
+                            True, 
+                            f"Extracted {len(auto_cookies)} cookies via automation"
+                        )
+                        
+                        driver.close()
+                        return client
+                except Exception as e:
+                    print(f"  Warning: Could not extract cookies: {e}")
+            
             driver.close()
             
         except Exception as e:
@@ -339,7 +348,7 @@ class EnhancedExamples:
             print(f"  {idx}. {source.get('title', 'N/A')}")
         
         # Related questions
-        print(f"\nRelated Questions:")
+        print("\nRelated Questions:")
         for q in response.related_questions[:3]:
             print(f"  - {q}")
         
@@ -368,7 +377,7 @@ class EnhancedExamples:
             "What is machine learning?",
             use_conversation=True
         )
-        print(f"Q: What is machine learning?")
+        print("Q: What is machine learning?")
         print(f"A: {response1.answer[:150]}...")
         
         # Follow-up query
@@ -377,7 +386,7 @@ class EnhancedExamples:
             "How is it different from deep learning?",
             use_conversation=True
         )
-        print(f"Q: How is it different from deep learning?")
+        print("Q: How is it different from deep learning?")
         print(f"A: {response2.answer[:150]}...")
         
         # Export conversation
@@ -510,8 +519,8 @@ class EnhancedExamples:
             loaded_cookies = cookie_manager.load_cookies("chrome_profile")
             print(f"✓ Loaded {len(loaded_cookies)} cookies from profile")
             
-            # Use with client
-            client = PerplexityClient(cookies=loaded_cookies)
+            # Use with client (demonstration - not actually used)
+            _ = PerplexityClient(cookies=loaded_cookies)
             print("✓ Client initialized with saved cookies")
             
         except Exception as e:
@@ -551,16 +560,10 @@ class EnhancedExamples:
             
             print(f"\nResponse:\n{response[:300]}...")
             
-            # Get sources
-            sources = driver.get_sources()
-            print(f"\nSources found: {len(sources)}")
-            
-            # Take screenshot
-            driver.save_screenshot("perplexity_search.png")
-            
-            # Export conversation
-            export = driver.export_conversation(format='markdown')
-            print(f"\nExport preview:\n{export[:200]}...")
+            # Note: The web driver's get_response_text() already extracts sources
+            # Additional methods like get_sources(), save_screenshot(), and 
+            # export_conversation() would need to be implemented in PerplexityWebDriver
+            print("\nNote: Response extracted successfully")
             
         finally:
             print("\nClosing browser...")
@@ -583,11 +586,7 @@ def run_example(example_num: int):
         5: lambda: asyncio.run(examples.example_5_batch_processing()),
         6: examples.example_6_streaming,
         7: examples.example_7_cookie_management,
-        8: examples.example_8_session_management,  # You'll need to implement this
-        9: examples.example_9_account_generation,  # You'll need to implement this
         10: examples.example_10_web_automation,
-        11: examples.example_11_interactive_mode,  # You'll need to implement this
-        12: lambda: asyncio.run(examples.example_12_complete_workflow())  # You'll need to implement this
     }
     
     if example_num in example_map:
@@ -620,7 +619,9 @@ def run_all_examples():
     
     examples = EnhancedExamples()
     
-    for i in range(1, 13):
+    available_examples = [1, 2, 3, 4, 5, 6, 7, 10]
+    
+    for i in available_examples:
         try:
             print(f"\n{'='*50}")
             print(f"EXAMPLE {i}")
@@ -635,7 +636,7 @@ def run_all_examples():
                 5: lambda: asyncio.run(examples.example_5_batch_processing()),
                 6: examples.example_6_streaming,
                 7: examples.example_7_cookie_management,
-                # ... add others as you implement them
+                10: examples.example_10_web_automation,
             }
             
             if i in example_methods:
@@ -643,7 +644,7 @@ def run_all_examples():
             else:
                 print(f"Example {i} not yet implemented in enhanced version")
             
-            if i < 12:  # Don't prompt after last example
+            if i != available_examples[-1]:  # Don't prompt after last example
                 input("\nPress Enter to continue to next example...")
                 
         except KeyboardInterrupt:
@@ -658,7 +659,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Enhanced Perplexity AI Wrapper Examples")
-    parser.add_argument('example', type=int, nargs='?', help='Example number (1-12)')
+    parser.add_argument('example', type=int, nargs='?', help='Example number (1-7, 10)')
     parser.add_argument('--all', action='store_true', help='Run all examples')
     parser.add_argument('--setup', action='store_true', help='Run connection setup only')
     
@@ -689,11 +690,7 @@ if __name__ == "__main__":
         print("  5.  Batch Processing")
         print("  6.  Streaming Response")
         print("  7.  Cookie Management")
-        print("  8.  Session Management")
-        print("  9.  Account Generation")
         print("  10. Web Automation")
-        print("  11. Interactive Mode")
-        print("  12. Complete Workflow")
         print("\nUsage:")
         print("  python complete_examples.py <number>    # Run specific example")
         print("  python complete_examples.py --all       # Run all examples")

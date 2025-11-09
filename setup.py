@@ -12,7 +12,7 @@ setup(
     version="1.0.0",
     author="Your Name",
     author_email="your.email@example.com",
-    description="Unofficial API Wrapper for Perplexity.ai",
+    description="API Wrapper for Perplexity.ai",
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=find_packages(where="src"),
@@ -21,7 +21,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "perplexity=src.interfaces.cli:main",
+            "perplexity=interfaces.cli:cli",
         ],
     },
 )

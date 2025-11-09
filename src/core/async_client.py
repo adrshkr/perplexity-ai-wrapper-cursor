@@ -14,6 +14,15 @@ from .models import (
     InvalidParameterError, NetworkError
 )
 
+# Note: cloudscraper is synchronous, so for async client we extract cookies
+# with cloudscraper and use them with aiohttp
+try:
+    from ..utils.cloudflare_bypass import CloudflareBypass
+    CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    CLOUDSCRAPER_AVAILABLE = False
+    CloudflareBypass = None
+
 
 class AsyncPerplexityClient:
     """
@@ -32,7 +41,8 @@ class AsyncPerplexityClient:
         timeout: int = 30,
         max_retries: int = 3,
         user_agent: Optional[str] = None,
-        connector: Optional[aiohttp.BaseConnector] = None
+        connector: Optional[aiohttp.BaseConnector] = None,
+        use_cloudflare_bypass: bool = True
     ):
         """
         Initialize async Perplexity client
@@ -44,10 +54,21 @@ class AsyncPerplexityClient:
             max_retries: Maximum retry attempts
             user_agent: Custom user agent string
             connector: Custom aiohttp connector
+            use_cloudflare_bypass: Extract cookies with cloudscraper if not provided
         """
         self.base_url = base_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
+        self.use_cloudflare_bypass = use_cloudflare_bypass and CLOUDSCRAPER_AVAILABLE
+        
+        # If no cookies provided and cloudscraper available, try to extract them
+        if not cookies and self.use_cloudflare_bypass:
+            try:
+                bypass = CloudflareBypass(use_stealth=True, interpreter='js2py')
+                if bypass.solve_challenge(base_url):
+                    cookies = bypass.get_cookies_dict()
+            except Exception:
+                pass  # Fallback to no cookies
         self.cookies = cookies or {}
         self.connector = connector
         self.session: Optional[aiohttp.ClientSession] = None
@@ -176,16 +197,69 @@ class AsyncPerplexityClient:
             )
     
     async def _direct_search(self, config: SearchConfig) -> SearchResponse:
-        """Execute direct (non-streaming) search"""
-        payload = config.to_payload()
+        """Execute direct (non-streaming) search using SSE endpoint"""
+        import uuid as uuid_module
+        
+        # Build payload according to discovered API format
+        frontend_uuid = str(uuid_module.uuid4())
+        frontend_context_uuid = str(uuid_module.uuid4())
+        
+        # Map mode to API format
+        mode_map = {
+            SearchMode.AUTO: "concise",
+            SearchMode.PRO: "copilot",
+            SearchMode.REASONING: "reasoning",
+            SearchMode.DEEP_RESEARCH: "research"
+        }
+        api_mode = mode_map.get(config.mode, "concise")
+        
+        payload = {
+            "params": {
+                "attachments": [],
+                "language": config.language,
+                "timezone": "UTC",
+                "search_focus": "internet",
+                "sources": [s.value for s in (config.sources or [SourceType.WEB])],
+                "search_recency_filter": None,
+                "frontend_uuid": frontend_uuid,
+                "mode": api_mode,
+                "model_preference": config.model.value if config.model else "turbo",
+                "is_related_query": False,
+                "is_sponsored": False,
+                "frontend_context_uuid": frontend_context_uuid,
+                "prompt_source": "user",
+                "query_source": "home"
+            },
+            "query": config.query,
+            "user_identity": {
+                "lang": config.language,
+                "country": "US",
+                "ab_active_tests": []
+            }
+        }
         
         for attempt in range(self.max_retries):
             try:
                 async with self.session.post(
-                    f"{self.base_url}/api/search",
+                    f"{self.base_url}/rest/sse/perplexity_ask",
                     json=payload
                 ) as response:
-                    return await self._handle_response(response, config.query)
+                    if response.status != 200:
+                        await self._handle_error_response(response)
+                    
+                    # Read SSE stream and accumulate complete response
+                    accumulated_data = {}
+                    async for line in response.content:
+                        if line:
+                            line_str = line.decode('utf-8', errors='ignore')
+                            if line_str.startswith('data: '):
+                                try:
+                                    chunk = json.loads(line_str[6:])  # Remove 'data: ' prefix
+                                    accumulated_data.update(chunk)
+                                except json.JSONDecodeError:
+                                    continue
+                    
+                    return self._parse_response(accumulated_data, config.query)
                     
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == self.max_retries - 1:
@@ -193,24 +267,65 @@ class AsyncPerplexityClient:
                 await asyncio.sleep(2 ** attempt)  # Exponential backoff
     
     async def _stream_search(self, config: SearchConfig) -> AsyncGenerator[Dict, None]:
-        """Execute streaming search"""
-        payload = config.to_payload()
+        """Execute streaming search using SSE endpoint"""
+        import uuid as uuid_module
+        
+        # Build payload according to discovered API format
+        frontend_uuid = str(uuid_module.uuid4())
+        frontend_context_uuid = str(uuid_module.uuid4())
+        
+        # Map mode to API format
+        mode_map = {
+            SearchMode.AUTO: "concise",
+            SearchMode.PRO: "copilot",
+            SearchMode.REASONING: "reasoning",
+            SearchMode.DEEP_RESEARCH: "research"
+        }
+        api_mode = mode_map.get(config.mode, "concise")
+        
+        payload = {
+            "params": {
+                "attachments": [],
+                "language": config.language,
+                "timezone": "UTC",
+                "search_focus": "internet",
+                "sources": [s.value for s in (config.sources or [SourceType.WEB])],
+                "search_recency_filter": None,
+                "frontend_uuid": frontend_uuid,
+                "mode": api_mode,
+                "model_preference": config.model.value if config.model else "turbo",
+                "is_related_query": False,
+                "is_sponsored": False,
+                "frontend_context_uuid": frontend_context_uuid,
+                "prompt_source": "user",
+                "query_source": "home"
+            },
+            "query": config.query,
+            "user_identity": {
+                "lang": config.language,
+                "country": "US",
+                "ab_active_tests": []
+            }
+        }
         
         async with self.session.post(
-            f"{self.base_url}/api/search/stream",
+            f"{self.base_url}/rest/sse/perplexity_ask",
             json=payload
         ) as response:
             
             if response.status != 200:
                 await self._handle_error_response(response)
             
+            # Stream SSE chunks
             async for line in response.content:
                 if line:
-                    try:
-                        data = json.loads(line.decode('utf-8'))
-                        yield data
-                    except json.JSONDecodeError:
-                        continue
+                    line_str = line.decode('utf-8', errors='ignore')
+                    if line_str.startswith('data: '):
+                        try:
+                            chunk = json.loads(line_str[6:])  # Remove 'data: ' prefix
+                            yield chunk
+                        except json.JSONDecodeError:
+                            continue
     
     async def _handle_response(
         self,

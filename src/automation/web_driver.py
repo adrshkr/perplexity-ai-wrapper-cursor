@@ -1,19 +1,169 @@
 """
-Perplexity AI Wrapper - Web Automation Driver
+Perplexity AI Wrapper - Browser Automation
 File: src/automation/web_driver.py
+
+Browser automation for Perplexity.ai using Playwright
 """
-from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext, ElementHandle
-from playwright.async_api import async_playwright
-import json
+import logging
+import sys
 import time
-from typing import Optional, Dict, List, Callable
+import threading
+from collections import deque
+from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Union
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# Suppress noisy third-party loggers
+logging.getLogger('playwright').setLevel(logging.WARNING)
+logging.getLogger('camoufox').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+
+# Try to import camoufox for better Cloudflare evasion
+CAMOUFOX_AVAILABLE = False
+Camoufox: Optional[Any] = None
+try:
+    from camoufox.sync_api import Camoufox as _Camoufox
+    CAMOUFOX_AVAILABLE = True
+    Camoufox = _Camoufox
+except ImportError:
+    CAMOUFOX_AVAILABLE = False
+
+# Import Playwright types only for type checking
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser, BrowserContext, Page, Playwright
+    from camoufox.sync_api import Camoufox
+
+# Try to import Playwright - only import at runtime, not for type checking
+try:
+    from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, Playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    if TYPE_CHECKING:
+        Browser = None  # type: ignore
+        BrowserContext = None  # type: ignore
+        Page = None  # type: ignore
+        Playwright = None  # type: ignore
+
+# Try to import cloudscraper for Cloudflare bypass
+CLOUDSCRAPER_AVAILABLE = False
+CloudflareBypass: Optional[Any] = None
+
+try:
+    import cloudscraper  # noqa: F401
+    CLOUDSCRAPER_AVAILABLE = True
+except ImportError:
+    # Try submodule path
+    project_root = Path(__file__).parent.parent.parent
+    cloudscraper_path = project_root / 'cloudscraper'
+    if cloudscraper_path.exists() and str(cloudscraper_path) not in sys.path:
+        sys.path.insert(0, str(cloudscraper_path))
+    try:
+        import cloudscraper  # noqa: F401
+        CLOUDSCRAPER_AVAILABLE = True
+    except ImportError:
+        CLOUDSCRAPER_AVAILABLE = False
+
+# Try to import CloudflareBypass wrapper
+if CLOUDSCRAPER_AVAILABLE:
+    try:
+        from ..utils.cloudflare_bypass import CloudflareBypass as _CloudflareBypass
+        CloudflareBypass = _CloudflareBypass
+    except ImportError:
+        CloudflareBypass = None
+
+
+class TabManager:
+    """Manages a pool of browser tabs for concurrent queries"""
+    
+    def __init__(self, context: BrowserContext, max_tabs: int = 5):
+        self.context = context
+        self.max_tabs = max_tabs
+        self.available_tabs: Deque[Page] = deque()
+        self.active_tabs: Dict[Page, Dict] = {}
+        self.lock = threading.Lock()
+    
+    def get_tab(self) -> Page:
+        """Get an available tab, creating one if needed"""
+        with self.lock:
+            # Reuse available tab if exists
+            if self.available_tabs:
+                tab = self.available_tabs.popleft()
+                try:
+                    if tab.is_closed():
+                        tab = self.context.new_page()
+                    else:
+                        # Clear tab for reuse
+                        try:
+                            tab.goto("about:blank", wait_until="domcontentloaded", timeout=2000)
+                        except Exception:
+                            pass
+                except Exception:
+                    tab = self.context.new_page()
+            else:
+                # Create new tab if under limit
+                if len(self.active_tabs) < self.max_tabs:
+                    tab = self.context.new_page()
+                else:
+                    # Reuse oldest tab
+                    oldest_tab = min(self.active_tabs.items(), key=lambda x: x[1].get('created_at', 0))[0]
+                    try:
+                        if not oldest_tab.is_closed():
+                            oldest_tab.goto("about:blank", wait_until="domcontentloaded", timeout=2000)
+                        tab = oldest_tab
+                        if tab in self.active_tabs:
+                            del self.active_tabs[tab]
+                    except Exception:
+                        tab = self.context.new_page()
+            
+            # Mark as active
+            self.active_tabs[tab] = {
+                'created_at': time.time(),
+                'state': 'active'
+            }
+            
+            return tab
+    
+    def release_tab(self, tab: Page, reuse: bool = True) -> None:
+        """Release a tab back to the pool"""
+        with self.lock:
+            if tab in self.active_tabs:
+                del self.active_tabs[tab]
+            
+            if reuse and not tab.is_closed():
+                self.available_tabs.append(tab)
+            else:
+                try:
+                    if not tab.is_closed():
+                        tab.close()
+                except Exception:
+                    pass
+    
+    def close_all(self) -> None:
+        """Close all tabs"""
+        with self.lock:
+            for tab in list(self.available_tabs):
+                try:
+                    if not tab.is_closed():
+                        tab.close()
+                except Exception:
+                    pass
+            self.available_tabs.clear()
+            
+            for tab in list(self.active_tabs.keys()):
+                try:
+                    if not tab.is_closed():
+                        tab.close()
+                except Exception:
+                    pass
+            self.active_tabs.clear()
 
 
 class PerplexityWebDriver:
-    """
-    Browser automation for Perplexity using Playwright
-    """
+    """Browser automation for Perplexity.ai using Playwright"""
     
     def __init__(
         self,
@@ -21,1261 +171,2416 @@ class PerplexityWebDriver:
         user_data_dir: Optional[str] = None,
         stealth_mode: bool = True
     ):
-        """
-        Initialize web driver
+        if not PLAYWRIGHT_AVAILABLE:
+            raise ImportError("Playwright is not installed. Install it with: pip install playwright && playwright install chromium")
         
-        Args:
-            headless: Run browser in headless mode
-            user_data_dir: Chrome user data directory
-            stealth_mode: Enable stealth features
-        """
         self.headless = headless
         self.user_data_dir = user_data_dir
         self.stealth_mode = stealth_mode
-        self.playwright = None
+        
+        self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
-        self.debug_network = False
-        self.network_requests = []
+        self.tab_manager: Optional[TabManager] = None
+        
+        self._login_cookies: Optional[Dict[str, str]] = None
+        self._cloudscraper_cookies: Optional[Dict[str, str]] = None
+        self._cloudscraper_user_agent: Optional[str] = None
+        self._cookies_injected: bool = False  # Track if cookies already injected
+        self._camoufox: Optional[Any] = None
     
-    def start(self, port: Optional[int] = None, debug_network: bool = False) -> None:
-        """
-        Start browser session
+    def set_cookies(self, cookies: Dict[str, str]) -> None:
+        """Store cookies to be injected before navigation"""
+        self._login_cookies = cookies
+    
+    def _should_inject_cookies(self) -> bool:
+        """Determine if cookies should be injected"""
+        # Don't inject cookies if using persistent context (user_data_dir)
+        # Persistent context already has cookies from previous sessions
+        if self.user_data_dir:
+            return False
         
-        Args:
-            port: Remote debugging port (connects to existing Chrome)
-            debug_network: Enable network request/response logging for debugging
-        """
-        self.playwright = sync_playwright().start()
-        self.debug_network = debug_network
-        self.network_requests = []  # Store network requests for debugging
+        # Only inject if we have cookies to inject
+        return bool(self._login_cookies or self._cloudscraper_cookies)
+    
+    def _inject_cookies_into_context(self) -> None:
+        """Inject all cookies into context BEFORE navigation - only if needed"""
+        if not self.context:
+            return
         
-        if port:
-            # Connect to existing Chrome instance
-            self.browser = self.playwright.chromium.connect_over_cdp(
-                f"http://localhost:{port}"
-            )
-            self.context = self.browser.contexts[0] if self.browser.contexts else self.browser.new_context()
-        else:
-            # Launch new browser
-            # REMOVED --disable-web-security as it triggers "unsafe browser" warnings
-            launch_options = {
-                'headless': self.headless,
-                'args': [
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-first-run',
-                    '--no-default-browser-check'
+        # Don't inject if using persistent context
+        if not self._should_inject_cookies():
+            return
+        
+        # OPTIMIZATION: Skip if cookies already injected
+        if self._cookies_injected:
+            logger.debug("Cookies already injected, skipping redundant injection")
+            return
+        
+        all_cookies = {}
+        # CRITICAL: Cloudflare cookies from cloudscraper MUST come first (they override old ones)
+        if self._cloudscraper_cookies:
+            all_cookies.update(self._cloudscraper_cookies)
+        # Then add login cookies (but don't override Cloudflare cookies)
+        if self._login_cookies:
+            for k, v in self._login_cookies.items():
+                # Don't override Cloudflare cookies that we just got from cloudscraper
+                if 'cf' not in k.lower() and not k.startswith('__cf'):
+                    all_cookies[k] = v
+        
+        if not all_cookies:
+            return
+        
+        playwright_cookies: List[Dict[str, Any]] = []
+        for name, value in all_cookies.items():
+            if not name or not isinstance(value, str) or len(str(value)) > 4000:
+                continue
+            try:
+                # Use URL-based cookie injection (more reliable than domain/path)
+                # Playwright prefers URL for cookie injection
+                cookie_data: Dict[str, Any] = {
+                    'name': str(name),
+                    'value': str(value),
+                    'url': 'https://www.perplexity.ai',  # Use URL instead of domain/path
+                    'secure': True,
+                    'sameSite': 'Lax',
+                }
+                
+                # Handle __Host- prefix (requires path=/ and no domain)
+                # But we can still use URL which is more compatible
+                if name.startswith('__Host-'):
+                    # For __Host- cookies, we still use URL but ensure path is /
+                    cookie_data['path'] = '/'
+                    # Don't set domain for __Host- cookies
+                    if 'domain' in cookie_data:
+                        del cookie_data['domain']
+                
+                playwright_cookies.append(cookie_data)
+            except Exception as e:
+                logger.debug(f"Failed to format cookie {name}: {e}")
+                continue
+        
+        if playwright_cookies:
+            logger.debug(f"Injecting {len(playwright_cookies)} cookies into browser context")
+            cf_clearance_injected = any(c.get('name') == 'cf_clearance' for c in playwright_cookies)
+            cf_bm_injected = any(c.get('name') == '__cf_bm' for c in playwright_cookies)
+            
+            if self._cloudscraper_cookies:
+                if not cf_clearance_injected:
+                    logger.warning("cf_clearance cookie not in cookies to inject")
+                if not cf_bm_injected:
+                    logger.warning("__cf_bm cookie not in cookies to inject")
+            
+            cf_cookies_to_inject: List[str] = []
+            for c in playwright_cookies:
+                cookie_name: Any = c.get('name')
+                if isinstance(cookie_name, str):
+                    name_lower = cookie_name.lower()
+                    if 'cf' in name_lower or cookie_name.startswith('__cf'):
+                        cf_cookies_to_inject.append(cookie_name)
+            if cf_cookies_to_inject:
+                logger.debug(f"Cloudflare cookies to inject: {cf_cookies_to_inject}")
+            
+            try:
+                self.context.add_cookies(playwright_cookies)  # type: ignore
+                logger.debug(f"Successfully injected {len(playwright_cookies)} cookies")
+                
+                # Verify cookies are in context
+                context_cookies = self.context.cookies()
+                context_cf_cookies = [
+                    c.get('name') for c in context_cookies 
+                    if 'cf' in c.get('name', '').lower() or c.get('name', '').startswith('__cf')
                 ]
+                if context_cf_cookies:
+                    logger.debug(f"Verified Cloudflare cookies in context: {context_cf_cookies}")
+                else:
+                    logger.warning("No Cloudflare cookies found in context after injection")
+                
+                # Mark cookies as injected
+                self._cookies_injected = True
+            except Exception as e:
+                # Silently try individual cookie injection without debug spam
+                injected_count = 0
+                failed_cookies = []
+                for cookie in playwright_cookies:
+                    try:
+                        self.context.add_cookies([cookie])  # type: ignore
+                        injected_count += 1
+                    except Exception as cookie_error:
+                        cookie_name = cookie.get('name', 'unknown')
+                        failed_cookies.append(cookie_name)
+                        # Only log critical cookies (cf_clearance) as warnings
+                        # Skip logging for known failing cookies like __Host-GAPS
+                        if cookie_name == 'cf_clearance':
+                            logger.warning(f"Failed to inject cf_clearance: {cookie_error}")
+                        # Suppress debug messages for other cookies to reduce noise
+                
+                # Only log summary if there are unexpected failures (not __Host-GAPS)
+                critical_failures = [c for c in failed_cookies if c not in ['__Host-GAPS']]
+                if critical_failures:
+                    logger.debug(f"Failed to inject {len(critical_failures)} cookies: {critical_failures[:5]}")
+                
+                # Only log success message at debug level if explicitly needed
+                if injected_count > 0:
+                    logger.debug(f"Injected {injected_count}/{len(playwright_cookies)} cookies successfully")
+                    # Mark cookies as injected
+                    self._cookies_injected = True
+                
+                # Verify after individual injection
+                context_cookies = self.context.cookies()
+                context_cf_cookies = [
+                    c.get('name') for c in context_cookies 
+                    if 'cf' in c.get('name', '').lower() or c.get('name', '').startswith('__cf')
+                ]
+                if context_cf_cookies:
+                    logger.debug(f"Verified Cloudflare cookies in context: {context_cf_cookies}")
+    
+    def _pre_authenticate_with_cloudscraper(self) -> None:
+        """
+        Solve Cloudflare challenge before browser opens - REQUIRED to bypass Cloudflare
+        Always gets fresh Cloudflare cookies (cf_clearance, __cf_bm) which are required
+        """
+        if not CLOUDSCRAPER_AVAILABLE:
+            raise ImportError(
+                "Cloudscraper is required for Cloudflare bypass. "
+                "Install it with: pip install cloudscraper requests"
+            )
+        
+        # Always use cloudscraper to get fresh Cloudflare cookies
+        # This is REQUIRED - Cloudflare blocks requests without valid cookies
+        logger.info("Solving Cloudflare challenge with cloudscraper")
+        try:
+            # Try CloudflareBypass wrapper first, but fall back to direct cloudscraper if it fails
+            use_wrapper = False
+            if CloudflareBypass is not None:
+                try:
+                    bypass = CloudflareBypass(
+                        browser='firefox',  # Changed to Firefox to match Camoufox
+                        use_stealth=True,
+                        interpreter='js2py',
+                        debug=False,
+                        auto_refresh_on_403=True,  # Automatically refresh session on 403 errors
+                        max_403_retries=5,  # Maximum retry attempts on 403 errors
+                        session_refresh_interval=3600  # Refresh session every hour
+                    )
+                    
+                    # Extract user agent from cloudscraper session for use in Playwright
+                    # This ensures fingerprint matching between cloudscraper and Playwright
+                    self._cloudscraper_user_agent = bypass.scraper.headers.get('User-Agent')
+                    if self._cloudscraper_user_agent:
+                        logger.debug(f"Extracted user agent from cloudscraper: {self._cloudscraper_user_agent[:50]}...")
+                    
+                    # If we have login cookies, pass them to cloudscraper to maintain session
+                    if self._login_cookies:
+                        bypass.update_cookies(self._login_cookies)
+                        logger.debug(f"Using {len(self._login_cookies)} login cookies with cloudscraper")
+                    
+                    # Solve Cloudflare challenge - this is REQUIRED
+                    if bypass.solve_challenge('https://www.perplexity.ai'):
+                        cloudscraper_cookies = bypass.get_cookies_dict()
+                        use_wrapper = True
+                    else:
+                        raise Exception("Cloudflare challenge solve returned False - may be blocked")
+                except Exception as wrapper_error:
+                    # CloudflareBypass wrapper failed, fall back to direct cloudscraper
+                    logger.warning(f"CloudflareBypass wrapper failed: {wrapper_error}, falling back to direct cloudscraper")
+                    use_wrapper = False
+            
+            if not use_wrapper:
+                # Use cloudscraper directly if wrapper not available
+                import cloudscraper
+                import time
+                
+                # Create scraper with proper browser emulation and stealth features
+                # This ensures cloudscraper matches the browser fingerprint we'll use in Playwright
+                logger.debug("Creating cloudscraper with browser emulation and stealth mode")
+                if not hasattr(cloudscraper, 'create_scraper'):
+                    raise ImportError("cloudscraper.create_scraper not available")
+                scraper = cloudscraper.create_scraper(  # type: ignore
+                    browser={
+                        'browser': 'firefox',  # Changed to Firefox to match Camoufox
+                        'platform': 'windows',
+                        'desktop': True
+                    },
+                    interpreter='js2py',  # Required for JavaScript challenge solving
+                    delay=5,  # Reduced delay for faster execution (was 10)
+                    debug=False,
+                    doubleDown=True,  # Enable double-down mode for better bypass
+                    enable_stealth=True,  # Enable stealth mode to avoid detection
+                    stealth_options={
+                        'min_delay': 1.0,
+                        'max_delay': 3.0,
+                        'human_like_delays': True,
+                        'randomize_headers': True,
+                        'browser_quirks': True
+                    },
+                    auto_refresh_on_403=True,  # Automatically refresh session on 403 errors
+                    max_403_retries=5,  # Maximum retry attempts on 403 errors
+                    session_refresh_interval=3600  # Refresh session every hour
+                )
+                
+                # Extract user agent from cloudscraper session for use in Playwright
+                # This ensures fingerprint matching between cloudscraper and Playwright
+                self._cloudscraper_user_agent = scraper.headers.get('User-Agent')
+                if self._cloudscraper_user_agent:
+                    logger.debug(f"Extracted user agent from cloudscraper: {self._cloudscraper_user_agent[:50]}...")
+                
+                logger.info("Getting fresh Cloudflare cookies with cloudscraper")
+                # Make request to trigger Cloudflare challenge if needed
+                # Cloudscraper will automatically solve it, but we need to wait for it to complete
+                max_attempts = 10  # Increased attempts for reliability
+                response = None
+                response_text_lower = ""
+                
+                for attempt in range(1, max_attempts + 1):
+                    logger.debug(f"Cloudflare bypass attempt {attempt}/{max_attempts}")
+                    try:
+                        # Use longer timeout and allow redirects
+                        response = scraper.get(
+                            'https://www.perplexity.ai', 
+                            timeout=90,  # Increased timeout for challenge solving
+                            allow_redirects=True
+                        )
+                        
+                        if response.status_code != 200:
+                            logger.debug(f"Status {response.status_code}, waiting and retrying (attempt {attempt}/{max_attempts})")
+                            # If we get multiple 403s in a row, Cloudflare is likely blocking us
+                            if response.status_code == 403 and attempt >= 5:
+                                logger.warning(f"Cloudflare is consistently returning 403 after {attempt} attempts")
+                                logger.warning("This may indicate IP blocking or advanced Cloudflare protection")
+                                if attempt >= max_attempts:
+                                    raise Exception(
+                                        f"Cloudflare blocking detected - received 403 status after {max_attempts} attempts. "
+                                        "Cloudflare may be blocking cloudscraper. Consider using browser automation instead."
+                                    )
+                            # Use exponential backoff instead of fixed sleep
+                            wait_time = min(1 + (attempt * 0.5), 3)  # 1.5s, 2s, 2.5s, max 3s
+                            time.sleep(wait_time)
+                            continue
+                        
+                        # Check if we got past Cloudflare
+                        response_text_lower = response.text.lower()
+                        has_challenge = ('just a moment' in response_text_lower or 
+                                       'checking your browser' in response_text_lower or
+                                       'please wait' in response_text_lower or
+                                       'cf-browser-verification' in response_text_lower)
+                        
+                        if has_challenge:
+                            wait_time = min(3 + attempt, 10)  # Reduced: 4s, 5s, 6s, etc., max 10s (was 12-30s)
+                            logger.debug(f"Still on Cloudflare challenge page (attempt {attempt}), waiting {wait_time}s")
+                            time.sleep(wait_time)  # Wait for JavaScript challenge to complete
+                            continue
+                        
+                        # Verify we got actual Perplexity content (not challenge page)
+                        has_perplexity_content = ('perplexity' in response_text_lower and 
+                                                 ('ask anything' in response_text_lower or 
+                                                  'search' in response_text_lower or
+                                                  'home' in response_text_lower))
+                        
+                        if has_perplexity_content:
+                            logger.info("Successfully bypassed Cloudflare - got Perplexity content")
+                            break
+                        else:
+                            logger.debug(f"Response doesn't look like Perplexity content (attempt {attempt})")
+                            wait_time = min(1 + attempt, 3)  # Exponential backoff
+                            time.sleep(wait_time)
+                            continue
+                            
+                    except Exception as e:
+                        logger.debug(f"Request failed (attempt {attempt}): {e}")
+                        if attempt < max_attempts:
+                            wait_time = min(1 + (attempt * 0.5), 3)  # Exponential backoff
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            raise
+                
+                # Final check - if we still have challenge, fail
+                if not response or response.status_code != 200:
+                    raise Exception(f"Failed to get Cloudflare cookies - status code: {response.status_code if response else 'None'}")
+                
+                response_text_lower = response.text.lower()
+                if 'just a moment' in response_text_lower or 'checking your browser' in response_text_lower:
+                    raise Exception("Still on Cloudflare challenge page after all attempts")
+                
+                # Wait briefly for cookies to be fully set after challenge completion
+                logger.debug("Waiting for Cloudflare cookies to be fully set")
+                time.sleep(0.3)  # Minimal wait - cookies are usually instant
+                
+                # Now we have fresh Cloudflare cookies
+                # Make one more request to ensure cookies are fully set
+                logger.debug("Making final request to ensure cookies are set")
+                try:
+                    scraper.get('https://www.perplexity.ai', timeout=10)  # Reduced timeout
+                    time.sleep(0.2)  # Minimal wait
+                except Exception as e:
+                    logger.debug(f"Final request failed (may be OK): {e}")
+                
+                # Use get_dict() method if available, otherwise use dict()
+                if hasattr(scraper.cookies, 'get_dict'):
+                    cloudscraper_cookies = scraper.cookies.get_dict()
+                else:
+                    cloudscraper_cookies = dict(scraper.cookies)
+                
+                # Also check response headers for Set-Cookie
+                # Response headers can be a string, list, or CaseInsensitiveDict
+                set_cookie_headers = []
+                if hasattr(response.headers, 'getall'):
+                    # requests library - getall() returns list
+                    set_cookie_headers = response.headers.getall('Set-Cookie', [])
+                elif isinstance(response.headers.get('Set-Cookie', ''), list):
+                    set_cookie_headers = response.headers.get('Set-Cookie', [])
+                else:
+                    # Single string value
+                    set_cookie_val = response.headers.get('Set-Cookie', '')
+                    if set_cookie_val:
+                        set_cookie_headers = [set_cookie_val]
+                
+                # Parse Set-Cookie headers to extract cookies
+                for cookie_header in set_cookie_headers:
+                    if 'cf_clearance=' in cookie_header:
+                        try:
+                            # Extract cf_clearance value from Set-Cookie header
+                            parts = cookie_header.split(';')[0].split('=')
+                            if len(parts) == 2 and parts[0].strip() == 'cf_clearance':
+                                cf_val = parts[1].strip()
+                                if cf_val and cf_val not in cloudscraper_cookies:
+                                    cloudscraper_cookies['cf_clearance'] = cf_val
+                                    logger.debug("Extracted cf_clearance from Set-Cookie header")
+                        except Exception:
+                            pass
+                
+                # Debug: Show all cookies cloudscraper got
+                logger.debug(f"Cloudscraper obtained {len(cloudscraper_cookies)} cookies")
+                cf_cookies_found = [k for k in cloudscraper_cookies.keys() if 'cf' in k.lower() or k.startswith('__cf')]
+                if cf_cookies_found:
+                    logger.debug(f"Cloudflare cookies from cloudscraper: {cf_cookies_found}")
+                else:
+                    logger.warning("No Cloudflare cookies found in cloudscraper response")
+                
+                # CRITICAL: Verify we got cf_clearance cookie (required for Cloudflare bypass)
+                cf_clearance = cloudscraper_cookies.get('cf_clearance')
+                if not cf_clearance:
+                    # Try to get it from response cookies (sometimes it's in the cookie jar but not in dict)
+                    for cookie in scraper.cookies:
+                        if cookie.name == 'cf_clearance':
+                            cf_clearance = cookie.value
+                            cloudscraper_cookies['cf_clearance'] = cookie.value
+                            logger.debug(f"Found cf_clearance in cookie jar (length: {len(cf_clearance)})")
+                            break
+                
+                # If cloudscraper didn't get cf_clearance, use the one from saved cookies (Option A)
+                # This can happen if Cloudflare isn't showing a challenge (cookies already valid)
+                if not cf_clearance and self._login_cookies:
+                    cf_clearance = self._login_cookies.get('cf_clearance')
+                    if cf_clearance:
+                        cloudscraper_cookies['cf_clearance'] = cf_clearance
+                        logger.warning("Using cf_clearance from saved cookies (cloudscraper didn't get one)")
+                
+                # If still no cf_clearance, log warning but continue
+                # Cloudflare might not be showing a challenge, or the browser might work without it
+                if not cf_clearance:
+                    logger.warning("cf_clearance cookie not obtained from cloudscraper or saved cookies, proceeding anyway")
+                else:
+                    logger.debug(f"Got cf_clearance cookie (length: {len(cf_clearance)})")
+                
+                # If we have login cookies, merge them (but Cloudflare cookies take precedence)
+                if self._login_cookies:
+                    # Keep Cloudflare cookies, add login cookies that aren't Cloudflare-related
+                    for k, v in self._login_cookies.items():
+                        if 'cf' not in k.lower() and not k.startswith('__cf'):
+                            cloudscraper_cookies[k] = v
+                    logger.debug(f"Merged {len(self._login_cookies)} login cookies with fresh Cloudflare cookies")
+                else:
+                    logger.debug("No login cookies to merge")
+            
+            # Get ALL cookies from cloudscraper (not just Cloudflare ones)
+            # Cloudflare cookies are critical, but other cookies may also be needed
+            self._cloudscraper_cookies = cloudscraper_cookies
+            if self._cloudscraper_cookies:
+                logger.info(f"Cloudflare challenge solved - got {len(self._cloudscraper_cookies)} cookies")
+                
+                # Verify we got critical Cloudflare cookies
+                cf_clearance = self._cloudscraper_cookies.get('cf_clearance')
+                cf_bm = self._cloudscraper_cookies.get('__cf_bm')
+                if not cf_clearance:
+                    logger.warning("cf_clearance cookie missing - Cloudflare may still block, continuing anyway")
+                else:
+                    logger.debug(f"cf_clearance cookie obtained (length: {len(cf_clearance)})")
+                if not cf_bm:
+                    logger.warning("__cf_bm cookie not found (may still work)")
+                
+                cf_cookies = [k for k in self._cloudscraper_cookies.keys() if 'cf' in k.lower() or k.startswith('__cf')]
+                logger.debug(f"Cloudflare cookies obtained: {cf_cookies}")
+            else:
+                logger.warning("No cookies obtained from cloudscraper")
+        except Exception as e:
+            # Cloudscraper failure - log but don't raise if we're in browser mode
+            # Browser will handle Cloudflare challenge directly
+            error_msg = f"Cloudscraper failed to solve Cloudflare challenge: {str(e)}"
+            logger.warning(error_msg)
+            # Only raise if we absolutely need cloudscraper (no cookies, no persistent context)
+            # Otherwise, let browser handle it
+            raise Exception(error_msg)
+    
+    def start(self, debug_network: bool = False) -> None:
+        """Start browser and initialize context - optimized with proper wait strategies"""
+        if not PLAYWRIGHT_AVAILABLE:
+            raise ImportError("Playwright is not installed")
+        
+        # Pre-authenticate with cloudscraper to get fresh Cloudflare cookies
+        # Skip if using persistent context (cookies persist) OR if we have login cookies (browser will handle Cloudflare)
+        # Only use cloudscraper if we have no cookies and no persistent context
+        if not self.user_data_dir and not self._login_cookies:
+            if not CLOUDSCRAPER_AVAILABLE:
+                logger.warning(
+                    "Cloudscraper not available - browser will handle Cloudflare challenge directly. "
+                    "This may be slower but should work."
+                )
+            else:
+                try:
+                    self._pre_authenticate_with_cloudscraper()
+                except Exception as e:
+                    logger.warning(f"Cloudscraper pre-authentication failed: {e}")
+                    logger.warning("Continuing with browser - it will handle Cloudflare challenge directly")
+                    # Clear any partial cloudscraper cookies
+                    self._cloudscraper_cookies = None
+        
+        # Use Camoufox if available (better Cloudflare evasion), otherwise fall back to Firefox
+        # According to https://camoufox.com/python/usage/, Camoufox is used as a context manager
+        # but we can also use it directly and access the browser
+        if CAMOUFOX_AVAILABLE and Camoufox is not None:
+            # Detect platform for headless mode selection
+            import platform
+            is_linux = platform.system() == 'Linux'
+            
+            mode_str = "headless (virtual display)" if self.headless and is_linux else "headless" if self.headless else "headed"
+            logger.debug(f"Using Camoufox for better Cloudflare evasion (mode: {mode_str})")
+            # Create Camoufox instance - it manages its own Playwright instance
+            # We'll use it as a context manager but keep it alive by storing it
+            # Use headless="virtual" for Linux (virtual display - best stealth)
+            # Use headless=True for Windows/Mac (regular headless)
+            # See: https://camoufox.com/python/virtual-display/
+            try:
+                # Virtual display only works on Linux
+                # On Windows/Mac, use regular headless mode
+                if self.headless:
+                    if is_linux:
+                        headless_mode = "virtual"  # Virtual display (Linux only)
+                        logger.info("Camoufox running in virtual display mode (Linux)")
+                    else:
+                        headless_mode = True  # Regular headless
+                        logger.info("Camoufox running in headless mode (Windows/Mac)")
+                else:
+                    headless_mode = False  # Normal windowed mode
+                    logger.debug("Camoufox running with visible browser window")
+                
+                self._camoufox = Camoufox(headless=headless_mode)
+                logger.debug(f"Camoufox instance created successfully with headless={headless_mode}")
+            except Exception as e:
+                logger.warning(f"Failed to create Camoufox instance: {e}")
+                logger.debug("Falling back to regular Playwright Firefox")
+                self._camoufox = None
+                
+            # Enter the context to get the browser
+            if self._camoufox is not None:
+                self._camoufox.__enter__()
+                self.browser = self._camoufox.browser  # Get the browser instance
+                logger.debug("Camoufox browser instance acquired")
+                # Camoufox manages its own playwright, we don't need to access it directly
+                # The browser object has all we need
+                self.playwright = None  # Camoufox manages playwright internally
+        else:
+            # Fallback to regular Playwright Firefox
+            mode_str = "headless" if self.headless else "headed"
+            logger.debug(f"Using regular Firefox (Camoufox not available) in {mode_str} mode")
+            self.playwright = sync_playwright().start()
+            
+            # Firefox-specific arguments (minimal, as Firefox is less detectable)
+            args: List[str] = []
+            if self.stealth_mode:
+                # Firefox doesn't need as many stealth flags
+                logger.debug("Stealth mode enabled for Firefox")
+            
+            # Browser launch options for Firefox
+            launch_options: Dict[str, Any] = {
+                'headless': self.headless,
+                'args': args,
             }
             
+            if self.headless:
+                logger.info("Launching Firefox in headless mode (no browser window)")
+            else:
+                logger.debug("Launching Firefox with visible window")
+            
             if self.user_data_dir:
-                # Use launch_persistent_context for persistent sessions
-                # IMPORTANT: Remove --disable-web-security as it triggers security warnings
-                persistent_args = [
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-first-run',
-                    '--no-default-browser-check',
-                    '--disable-setuid-sandbox'
-                ]
-                self.browser = self.playwright.chromium.launch_persistent_context(
-                    user_data_dir=self.user_data_dir,
-                    headless=self.headless,
-                    args=persistent_args,
-                    viewport={'width': 1280, 'height': 720},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    locale='en-US',
-                    timezone_id='America/New_York',
-                    ignore_https_errors=False
-                )
-                # Persistent context already creates a context, so we get it
-                self.context = self.browser  # launch_persistent_context returns BrowserContext
-            else:
-                # Regular launch for non-persistent sessions
-                self.browser = self.playwright.chromium.launch(**launch_options)
+                launch_options['user_data_dir'] = self.user_data_dir
             
-            if not self.user_data_dir:
-                # Create context for regular launch
-                self.context = self.browser.new_context(
-                    viewport={'width': 1280, 'height': 720},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                )
+            self.browser = self.playwright.firefox.launch(**launch_options)
         
-        # Get page from context (persistent context already has one, or create new)
-        if self.user_data_dir:
-            # Persistent context - get existing pages or create new
-            if self.context.pages:
-                self.page = self.context.pages[0]
-            else:
-                self.page = self.context.new_page()
-        else:
-            # Regular context - create new page
-            self.page = self.context.new_page() if self.context else self.browser.new_page()
+        # Create context with cloudscraper's user agent to match fingerprint
+        context_options: Dict[str, Any] = {
+            'viewport': {'width': 1920, 'height': 1080},
+            'ignore_https_errors': False,  # Don't ignore HTTPS errors (more secure)
+            'java_script_enabled': True,
+            'accept_downloads': False,  # Don't auto-accept downloads
+            'locale': 'en-US',
+            'timezone_id': 'America/New_York',
+            'permissions': [],
+            'color_scheme': 'light',
+        }
         
-        # Set up network monitoring if enabled
-        if debug_network:
-            self._setup_network_monitoring()
-        
-        # Apply stealth mode BEFORE navigating (critical for detection avoidance)
+        # Enhanced stealth mode - add more realistic browser fingerprinting
         if self.stealth_mode:
-            self._apply_stealth()
+            # Add extra headers to look more like a real browser
+            context_options['extra_http_headers'] = {
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0',
+            }
         
-        print("✓ Browser started")
-    
-    def _setup_network_monitoring(self) -> None:
-        """Set up network request/response monitoring for debugging"""
-        if not self.page:
-            return
+        # Use cloudscraper's user agent if available (matches browser emulation)
+        if self._cloudscraper_user_agent:
+            context_options['user_agent'] = self._cloudscraper_user_agent
+            logger.debug("Using cloudscraper's user agent in Playwright context")
+        else:
+            # Fallback to default Firefox user agent (matches Camoufox)
+            context_options['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
         
-        def on_request(request):
-            """Log outgoing requests"""
-            url = request.url
-            if 'perplexity.ai' in url:
-                self.network_requests.append({
-                    'type': 'request',
-                    'url': url,
-                    'method': request.method,
-                    'timestamp': time.time()
-                })
-                if self.debug_network:
-                    print(f"  [NETWORK] → {request.method} {url[:80]}...", flush=True)
+        if not self.browser:
+            raise Exception("Browser not initialized")
+        self.context = self.browser.new_context(**context_options)  # type: ignore
         
-        def on_response(response):
-            """Log incoming responses"""
-            url = response.url
-            if 'perplexity.ai' in url:
-                status = response.status
-                self.network_requests.append({
-                    'type': 'response',
-                    'url': url,
-                    'status': status,
-                    'timestamp': time.time()
-                })
-                if self.debug_network:
-                    print(f"  [NETWORK] ← {status} {url[:80]}...", flush=True)
-        
-        self.page.on("request", on_request)
-        self.page.on("response", on_response)
-    
-    def _apply_stealth(self) -> None:
-        """Apply stealth techniques to avoid detection"""
-        if not self.page:
-            return
-        
-        # Enhanced stealth script to avoid detection
-        self.page.add_init_script("""
-            // Remove webdriver property
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-            });
-            
-            // Override plugins
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5],
-            });
-            
-            // Override languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en'],
-            });
-            
-            // Chrome runtime (important for detection)
-            window.chrome = {
-                runtime: {},
-                loadTimes: function() {},
-                csi: function() {},
-                app: {}
-            };
-            
-            // Permissions
+        # Inject stealth JavaScript to hide automation indicators
+        if self.stealth_mode:
+            self.context.add_init_script("""
+                // Override navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                
+                // Override browser runtime (for compatibility)
+                if (!window.chrome) {
+                    window.chrome = {
+                        runtime: {}
+                    };
+                }
+                
+                // Override permissions
             const originalQuery = window.navigator.permissions.query;
             window.navigator.permissions.query = (parameters) => (
                 parameters.name === 'notifications' ?
                     Promise.resolve({ state: Notification.permission }) :
                     originalQuery(parameters)
             );
-            
-            // Override getBattery
-            if (navigator.getBattery) {
-                navigator.getBattery = () => Promise.resolve({
-                    charging: true,
-                    chargingTime: 0,
-                    dischargingTime: Infinity,
-                    level: 1
+                
+                // Override plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
                 });
-            }
-            
-            // Override webdriver in navigator
-            delete navigator.__proto__.webdriver;
-            
-            // Canvas fingerprinting protection
-            const getImageData = CanvasRenderingContext2D.prototype.getImageData;
-            CanvasRenderingContext2D.prototype.getImageData = function() {
-                const imageData = getImageData.apply(this, arguments);
-                for (let i = 0; i < imageData.data.length; i += 4) {
-                    imageData.data[i] += Math.floor(Math.random() * 10) - 5;
+                
+                // Override languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+                
+                // Override platform
+                Object.defineProperty(navigator, 'platform', {
+                    get: () => 'Win32'
+                });
+                
+                // Firefox-specific overrides
+                if (navigator.userAgent.includes('Firefox')) {
+                    // Ensure Firefox-specific properties are present
+                    if (!navigator.mimeTypes) {
+                        Object.defineProperty(navigator, 'mimeTypes', {
+                            get: () => []
+                        });
+                    }
                 }
-                return imageData;
-            };
-        """)
+            """)
+            logger.debug("Stealth mode enabled - automation indicators hidden")
+        
+        # Enable network debugging if requested
+        if debug_network:
+            def log_request(request: Any) -> None:
+                logger.debug(f"→ {request.method} {request.url}")
+            def log_response(response: Any) -> None:
+                logger.debug(f"← {response.status} {response.url}")
+            self.context.on("request", log_request)
+            self.context.on("response", log_response)
+        
+        # Inject cookies into context BEFORE creating pages - only if needed
+        self._inject_cookies_into_context()
+        
+        # No need to wait after cookie injection - context.add_cookies is synchronous
+        
+        # Create main page (always create, regardless of cookie injection)
+        self.page = self.context.new_page()
+        
+        # Initialize tab manager
+        self.tab_manager = TabManager(self.context, max_tabs=5)
     
-    def set_cookies(self, cookies: Dict[str, str]) -> None:
+    def navigate_to_perplexity(self, page: Optional[Page] = None) -> None:
         """
-        Set cookies in browser context
-        
-        Args:
-            cookies: Dictionary of cookie name-value pairs
+        Navigate to Perplexity homepage with optimal wait strategies
+        Uses Playwright's built-in wait strategies - no fixed timeouts
         """
-        if not self.context:
-            raise Exception("Browser context not initialized")
-        
-        # Navigate to the domain first (required for Playwright)
-        if not self.page:
-            self.page = self.context.new_page()
-        
-        # Navigate to domain to set cookies
-        self.page.goto("https://www.perplexity.ai", wait_until="domcontentloaded")
-        
-        # Convert to Playwright cookie format
-        # Playwright requires 'url' OR both 'domain' and 'path'
-        playwright_cookies = []
-        for name, value in cookies.items():
-            # Skip invalid cookies
-            if not name or not isinstance(value, str):
-                continue
-            
-            # Playwright has cookie size limits (4096 bytes)
-            if len(str(value)) > 4000:
-                print(f"⚠ Skipping cookie '{name}' - value too long")
-                continue
-            
-            try:
-                cookie_obj = {
-                    'name': str(name),
-                    'value': str(value),
-                    'url': 'https://www.perplexity.ai',  # Use url instead of domain+path
-                }
-                playwright_cookies.append(cookie_obj)
-            except Exception as e:
-                print(f"⚠ Skipping cookie '{name}' - {e}")
-                continue
-        
-        if playwright_cookies:
-            try:
-                self.context.add_cookies(playwright_cookies)
-                print(f"✓ Set {len(playwright_cookies)} cookies")
-            except Exception as e:
-                print(f"⚠ Error setting cookies: {e}")
-                print("  Some cookies may be invalid or expired")
-                # Try setting cookies one by one
-                success_count = 0
-                for cookie in playwright_cookies:
-                    try:
-                        self.context.add_cookies([cookie])
-                        success_count += 1
-                    except:
-                        pass
-                print(f"✓ Set {success_count}/{len(playwright_cookies)} cookies")
-    
-    def navigate_to_perplexity(self) -> None:
-        """Navigate to Perplexity homepage"""
-        if not self.page:
+        target_page = page or self.page
+        if not target_page:
             raise Exception("Browser not started")
         
-        print("Navigating to Perplexity...")
-        # Use domcontentloaded for faster initial load, then wait for search input
-        self.page.goto(
-            "https://www.perplexity.ai", 
-            wait_until="domcontentloaded",
-            timeout=30000
-        )
-        # Wait for search input to be ready (more efficient than fixed sleep)
+        # Inject cookies if needed (only if not using persistent context)
+        if self.context and self._should_inject_cookies():
+            self._inject_cookies_into_context()
+        
+        # Navigate with fast wait strategy - use domcontentloaded for speed
+        # Total wait time should be 2-3 seconds max
         try:
-            self.page.wait_for_selector('[contenteditable="true"], textarea', timeout=5000, state="visible")
-        except:
-            pass  # Continue even if not found immediately
-        print("✓ Loaded Perplexity")
+            target_page.goto(
+                "https://www.perplexity.ai",
+                wait_until="domcontentloaded",  # Faster than 'load'
+                timeout=15000  # Increased to 15 seconds to allow Cloudflare challenge
+            )
+            
+            # Wait for Cloudflare challenge to complete if present
+            try:
+                # Check if Cloudflare challenge is present
+                has_challenge = target_page.evaluate("""
+                    () => {
+                        const bodyText = document.body.textContent || '';
+                        return bodyText.includes('just a moment') || 
+                               bodyText.includes('checking your browser') ||
+                               bodyText.includes('Enable JavaScript and cookies') ||
+                               bodyText.includes('Please wait');
+                    }
+                """)
+                
+                if has_challenge:
+                    logger.warning("Cloudflare challenge detected, waiting for it to complete")
+                    # Wait for challenge to disappear (up to 10 seconds)
+                    target_page.wait_for_function(
+                        "() => !document.body.textContent.includes('just a moment') && !document.body.textContent.includes('checking your browser') && !document.body.textContent.includes('Enable JavaScript and cookies')",
+                        timeout=10000
+                    )
+                    logger.debug("Cloudflare challenge completed")
+                    # Wait a bit more for page to fully load after challenge
+                    target_page.wait_for_timeout(1000)
+            except Exception:
+                # Challenge might have already completed or wasn't present
+                pass
+        except Exception as e:
+            # If domcontentloaded times out, check if we're at least on the page
+            current_url = target_page.url
+            if 'perplexity.ai' not in current_url.lower():
+                raise Exception(f"Failed to navigate to Perplexity. Current URL: {current_url}. Error: {str(e)}")
+        
+        # Check for Cloudflare challenge and wait for it to complete
+        # Playwright should handle this automatically, but we need to wait
+        cloudflare_detected = target_page.evaluate("""
+            () => {
+                const bodyText = (document.body?.textContent || '').toLowerCase();
+                return bodyText.includes('just a moment') || 
+                       bodyText.includes('checking your browser') ||
+                       bodyText.includes('please wait');
+            }
+        """)
+        
+        if cloudflare_detected:
+            # Wait for Cloudflare challenge to complete (max 10 seconds)
+            logger.warning("Cloudflare challenge detected, waiting for completion")
+            try:
+                # Wait for the challenge page to disappear
+                target_page.wait_for_function(
+                    "() => !document.body?.textContent?.toLowerCase().includes('just a moment') && !document.body?.textContent?.toLowerCase().includes('checking your browser')",
+                    timeout=10000
+                )
+                logger.debug("Cloudflare challenge completed")
+            except Exception:
+                # If timeout, continue anyway - might have passed
+                logger.warning("Cloudflare challenge wait timed out, continuing")
+        
+        # Small wait for page to settle (reduced from networkidle)
+        target_page.wait_for_timeout(500)  # 0.5 second wait
+        
+        # Verify we're on Perplexity (not redirected)
+        current_url = target_page.url
+        if 'perplexity.ai' not in current_url.lower():
+            raise Exception(f"Not on Perplexity domain. Current URL: {current_url}")
+        
+        # Refresh/validate session by checking auth status and refreshing if needed
+        # This helps refresh expired cookies and ensures session is active
+        try:
+            logger.debug("Checking session status")
+            target_page.wait_for_timeout(1000)  # Wait for page to fully load
+            
+            # Check auth session status via API
+            try:
+                response = target_page.request.get('https://www.perplexity.ai/api/auth/session', timeout=5000)
+                if response.status == 200:
+                    session_data = response.json()
+                    if session_data and session_data.get('user'):
+                        logger.debug("Session is valid and user is authenticated")
+                    else:
+                        # Session API returned empty - cookies are expired or invalid
+                        logger.warning("Session API returned no user - cookies may be expired, attempting refresh")
+                        
+                        # Make a request that requires auth - this might refresh cookies
+                        # Try accessing a protected endpoint or making a search request
+                        try:
+                            # Make a request to refresh the session
+                            target_page.request.get('https://www.perplexity.ai/api/auth/csrf', timeout=5000)
+                            # Reload to pick up any new cookies
+                            target_page.reload(wait_until="domcontentloaded", timeout=5000)
+                            target_page.wait_for_timeout(1000)
+                            
+                            # Re-inject cookies after refresh
+                            if self.context and self._should_inject_cookies():
+                                logger.debug("Re-injecting cookies after refresh attempt")
+                                self._inject_cookies_into_context()
+                        except Exception as e:
+                            logger.warning(f"Could not refresh session: {e}")
+                else:
+                    logger.warning(f"Session check returned status {response.status}")
+            except Exception as e:
+                logger.warning(f"Could not check session: {e}")
+        except Exception as e:
+            logger.warning(f"Session refresh failed: {e}")
+            # Continue anyway - might still work
+        
+        # Wait for search input to be visible - reduced timeout for speed
+        # Based on actual page structure: textbox with "Ask anything" text
+        search_selectors = [
+            '#ask-input',  # Exact ID - fastest
+            'textbox',  # Primary selector - Playwright identifies it as textbox
+            '[contenteditable="true"]',
+        ]
+        
+        search_box_found = False
+        for selector in search_selectors:
+            try:
+                # Reduced timeout to 2 seconds per selector (max 2-3 seconds total)
+                target_page.wait_for_selector(selector, timeout=2000, state="visible")
+                search_box_found = True
+                break
+            except Exception:
+                continue
+        
+        if not search_box_found:
+            # Get diagnostic info
+            page_url = target_page.url
+            page_title = target_page.title()
+            
+            # Check if we're on a login/redirect page
+            if 'login' in page_url.lower() or 'sign' in page_url.lower():
+                raise Exception(
+                    f"Redirected to login page. URL: {page_url}, Title: {page_title}. "
+                    "If using persistent context, make sure you're logged in. "
+                    "If using cookies, make sure they're valid."
+                )
+            
+            raise Exception(
+                f"Search box not found. URL: {page_url}, Title: {page_title}. "
+                "Page may not have loaded correctly or you may need to login."
+            )
+        
+        # Verify cookies are present in browser after navigation
+        browser_cookies = target_page.context.cookies()
+        browser_cf_cookies = [c.get('name') for c in browser_cookies if 'cf' in c.get('name', '').lower() or c.get('name', '').startswith('__cf')]
+        if browser_cf_cookies:
+            logger.debug(f"Cloudflare cookies present in browser: {browser_cf_cookies}")
+        else:
+            logger.warning("No Cloudflare cookies found in browser after navigation")
+        
+        # Check specifically for cf_clearance
+        cf_clearance_in_browser = any(c.get('name') == 'cf_clearance' for c in browser_cookies)
+        if cf_clearance_in_browser:
+            logger.debug("cf_clearance cookie verified in browser")
+        else:
+            logger.warning("cf_clearance cookie not found in browser - may be blocked by Cloudflare")
+        
+        # Check for login modal - this is the real blocker, not Cloudflare
+        login_modal_detected = target_page.evaluate("""
+            () => {
+                // Check for login modal text
+                const bodyText = (document.body?.textContent || '').toLowerCase();
+                const hasLoginText = bodyText.includes('sign in or create an account') || 
+                                    bodyText.includes('unlock pro search');
+                
+                // Check for login modal element
+                const loginModal = Array.from(document.querySelectorAll('*')).find(el => {
+                    const text = (el.textContent || '').toLowerCase();
+                    return (text.includes('sign in or create an account') || 
+                           text.includes('continue with google') ||
+                           text.includes('continue with apple')) &&
+                           el.offsetParent !== null; // Element is visible
+                });
+                
+                return {
+                    hasLoginModal: loginModal !== undefined,
+                    hasLoginText: hasLoginText,
+                    modalVisible: loginModal !== undefined
+                };
+            }
+        """)
+        
+        if login_modal_detected.get('modalVisible') or login_modal_detected.get('hasLoginText'):
+            # Check if we have auth cookies
+            browser_cookies = target_page.context.cookies()
+            has_auth_token = any(
+                c.get('name') == '__Secure-next-auth.session-token' or 
+                c.get('name') == 'next-auth.session-token'
+                for c in browser_cookies
+            )
+            
+            if not has_auth_token:
+                # Check session API to confirm cookies are expired
+                try:
+                    session_response = target_page.request.get('https://www.perplexity.ai/api/auth/session', timeout=3000)
+                    if session_response.status == 200:
+                        session_data = session_response.json()
+                        if not session_data or not session_data.get('user'):
+                            raise Exception(
+                                "Cookies are expired or invalid. Session API returned no user. "
+                                "Please extract fresh cookies from your browser while logged into Perplexity. "
+                                "Use: perplexity cookies extract --profile <name>"
+                            )
+                except Exception as api_error:
+                    if "expired" in str(api_error).lower() or "invalid" in str(api_error).lower():
+                        raise
+                
+                raise Exception(
+                    "Login modal detected and no authentication token cookie found. "
+                    "Please ensure you have valid login cookies with '__Secure-next-auth.session-token'. "
+                    "Extract fresh cookies from your browser while logged in: "
+                    "perplexity cookies extract --profile <name>"
+                )
+            else:
+                logger.debug("Login modal detected but auth token present - modal may be transient")
+        else:
+            logger.debug("No login modal detected - user appears to be logged in")
+    
+    def _verify_logged_in(self, page: Optional[Page] = None) -> bool:
+        """
+        Verify if user is logged in by checking for login modal/prompt
+        Returns True if logged in, False otherwise
+        """
+        target_page = page or self.page
+        if not target_page:
+            return False
+        
+        try:
+            login_status = target_page.evaluate("""
+                () => {
+                    // Check for login modal/prompt
+                    const loginModal = document.querySelector('[class*="modal"], [class*="dialog"], [class*="popup"]');
+                    const loginText = Array.from(document.querySelectorAll('*')).find(el => {
+                        const text = (el.textContent || '').toLowerCase();
+                        return text.includes('sign in or create an account') || 
+                               text.includes('unlock pro search') ||
+                               (text.includes('sign in') && el.closest('button, a'));
+                    });
+                    
+                    // Check for user profile/account indicator (logged in)
+                    const userProfile = document.querySelector('[class*="avatar"], [class*="profile"], [class*="user"]');
+                    const accountButton = Array.from(document.querySelectorAll('button, a')).find(el => {
+                        const text = (el.textContent || '').toLowerCase();
+                        return text === 'account' || text.includes('profile') || text.includes('settings');
+                    });
+                    
+                    // Check for prominent login buttons in header
+                    const prominentLogin = Array.from(document.querySelectorAll('a, button')).filter(el => {
+                        const text = (el.textContent || '').toLowerCase();
+                        const href = (el.getAttribute('href') || '').toLowerCase();
+                        const parent = el.closest('header, nav, [class*="header"], [class*="nav"]');
+                        if (!parent) return false;
+                        return (text.includes('sign in') || text.includes('log in') || 
+                               href.includes('login') || href.includes('sign'));
+                    });
+                    
+                    // Logged in if:
+                    // 1. No login modal visible
+                    // 2. No prominent login buttons
+                    // 3. (Optional) User profile/account indicator present
+                    const hasLoginModal = loginModal && loginModal.offsetParent !== null;
+                    const hasLoginPrompt = loginText !== undefined;
+                    const hasProminentLogin = prominentLogin.length > 0;
+                    const hasUserProfile = userProfile !== null || accountButton !== undefined;
+                    
+                    return {
+                        logged_in: !hasLoginModal && !hasLoginPrompt && !hasProminentLogin,
+                        hasLoginModal: hasLoginModal,
+                        hasLoginPrompt: hasLoginPrompt,
+                        hasProminentLogin: hasProminentLogin.length > 0,
+                        hasUserProfile: hasUserProfile,
+                        details: {
+                            loginModalFound: hasLoginModal,
+                            loginTextFound: hasLoginPrompt,
+                            prominentLoginCount: prominentLogin.length,
+                            userProfileFound: hasUserProfile
+                        }
+                    };
+                }
+            """)
+            
+            return login_status.get('logged_in', False)
+        except Exception:
+            # If check fails, assume not logged in to be safe
+            return False
     
     def search(
         self,
         query: str,
         wait_for_response: bool = True,
-        timeout: int = 60000
-    ) -> str:
-        """
-        Execute search via UI
-        
-        Args:
-            query: Search query
-            wait_for_response: Wait for AI response
-            timeout: Timeout in milliseconds
-        
-        Returns:
-            Response text
-        """
-        if not self.page:
+        timeout: int = 60000,
+        extract_images: bool = False,
+        image_dir: Optional[str] = None,
+        structured: bool = False,
+        page: Optional[Page] = None
+    ) -> Union[str, Dict[str, Any]]:
+        """Execute search query"""
+        target_page = page or self.page
+        if not target_page:
             raise Exception("Browser not started")
         
-        print(f"Searching: {query}", flush=True)
-        
-        # Ensure page is interactive (minimal wait)
-        try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=2000)
-        except:
-            pass
-        
-        # Use JavaScript to find the search input more reliably
-        # This handles both textarea and contenteditable div cases
-        print("  Using JavaScript to find search input...", flush=True)
+        # Find search box - using exact selectors based on actual page structure
         search_box = None
-        last_error = None
+        search_selectors = [
+            '#ask-input',  # Exact ID from page
+            '[contenteditable="true"]',  # Fallback for contenteditable div
+            'textarea[placeholder*="Ask"]',  # Fallback for textarea
+            'textarea'  # Last resort
+        ]
         
-        try:
-            # JavaScript function to find search input
-            # Handles both textarea and contenteditable div elements
-            search_element_info = self.page.evaluate("""
-                () => {
-                    // Function to check if element is visible
-                    const isVisible = (el) => {
-                        if (!el) return false;
-                        const style = window.getComputedStyle(el);
-                        return style.display !== 'none' && 
-                               style.visibility !== 'hidden' && 
-                               style.opacity !== '0' &&
-                               el.offsetWidth > 0 && 
-                               el.offsetHeight > 0;
-                    };
-                    
-                    // Try textareas first
-                    const textareas = Array.from(document.querySelectorAll('textarea'));
-                    for (const textarea of textareas) {
-                        if (isVisible(textarea)) {
-                            const placeholder = textarea.getAttribute('placeholder') || '';
-                            const text = textarea.textContent || '';
-                            if (placeholder.toLowerCase().includes('ask') || 
-                                placeholder.toLowerCase().includes('anything') ||
-                                text.toLowerCase().includes('ask anything')) {
-                                return {
-                                    type: 'textarea',
-                                    tag: 'textarea',
-                                    placeholder: placeholder,
-                                    className: textarea.className,
-                                    id: textarea.id || '',
-                                    selector: 'textarea' + (textarea.id ? '#' + textarea.id : '') + 
-                                              (textarea.className ? '.' + textarea.className.split(' ')[0] : '')
-                                };
-                            }
-                        }
-                    }
-                    
-                    // Try contenteditable divs (modern UI)
-                    const contenteditables = Array.from(document.querySelectorAll('[contenteditable="true"]'));
-                    for (const div of contenteditables) {
-                        if (isVisible(div)) {
-                            const text = div.textContent || '';
-                            const innerHTML = div.innerHTML || '';
-                            const placeholder = div.getAttribute('placeholder') || 
-                                              div.getAttribute('data-placeholder') || '';
-                            
-                            // Check if it contains "Ask anything" or similar
-                            if (text.toLowerCase().includes('ask anything') ||
-                                text.toLowerCase().includes('ask') ||
-                                innerHTML.toLowerCase().includes('ask anything') ||
-                                placeholder.toLowerCase().includes('ask')) {
-                                return {
-                                    type: 'contenteditable',
-                                    tag: 'div',
-                                    placeholder: placeholder,
-                                    text: text.substring(0, 100),
-                                    className: div.className,
-                                    id: div.id || '',
-                                    selector: (div.id ? '#' + div.id : '') + 
-                                              (div.className ? '.' + div.className.split(' ').filter(c => c).join('.') : '')
-                                };
-                            }
-                        }
-                    }
-                    
-                    // Fallback: any visible textarea or contenteditable
-                    for (const textarea of textareas) {
-                        if (isVisible(textarea) && !textarea.disabled) {
-                            return {
-                                type: 'textarea',
-                                tag: 'textarea',
-                                placeholder: textarea.getAttribute('placeholder') || '',
-                                className: textarea.className,
-                                id: textarea.id || '',
-                                selector: 'textarea'
-                            };
-                        }
-                    }
-                    
-                    for (const div of contenteditables) {
-                        if (isVisible(div)) {
-                            return {
-                                type: 'contenteditable',
-                                tag: 'div',
-                                placeholder: div.getAttribute('placeholder') || '',
-                                text: div.textContent.substring(0, 100),
-                                className: div.className,
-                                id: div.id || '',
-                                selector: '[contenteditable="true"]'
-                            };
-                        }
-                    }
-                    
-                    return null;
-                }
-            """)
-            
-            if search_element_info:
-                print(f"  ✓ Found search element:", flush=True)
-                print(f"    Type: {search_element_info.get('type')}", flush=True)
-                print(f"    Tag: {search_element_info.get('tag')}", flush=True)
-                print(f"    Placeholder: {search_element_info.get('placeholder', '')[:80]}", flush=True)
-                print(f"    Selector: {search_element_info.get('selector', '')}", flush=True)
-                
-                # Now try to get the element using the found selector
-                selector = search_element_info.get('selector', '')
-                if selector:
-                    try:
-                        # Try exact selector first
-                        search_box = self.page.query_selector(selector)
-                        if not search_box or not search_box.is_visible():
-                            # Try with more specific selector
-                            if search_element_info.get('id'):
-                                search_box = self.page.query_selector(f"#{search_element_info['id']}")
-                            elif search_element_info.get('className'):
-                                classes = search_element_info['className'].split(' ')[:2]  # First 2 classes
-                                class_selector = '.' + '.'.join([c for c in classes if c])
-                                search_box = self.page.query_selector(class_selector)
-                    except:
-                        pass
-                
-                # If still not found, use JavaScript to get element directly via selector
-                if not search_box and search_element_info:
-                    # Try to construct a better selector from the info we got
-                    element_id = search_element_info.get('id')
-                    element_classes = search_element_info.get('className', '').split()
-                    
-                    if element_id:
-                        try:
-                            search_box = self.page.query_selector(f"#{element_id}")
-                        except:
-                            pass
-                    
-                    if not search_box and element_classes:
-                        # Try with first few classes
-                        for cls in element_classes[:3]:
-                            if cls:
-                                try:
-                                    potential = self.page.query_selector(f".{cls}")
-                                    if potential and potential.is_visible():
-                                        # Verify it matches our criteria
-                                        text = potential.inner_text() or ''
-                                        placeholder = potential.get_attribute('placeholder') or ''
-                                        if 'ask' in text.lower() or 'ask' in placeholder.lower():
-                                            search_box = potential
-                                            break
-                                except:
-                                    continue
-                    
-                    # Last resort: use evaluate_handle to get element directly
-                    if not search_box:
-                        try:
-                            js_handle = self.page.evaluate_handle("""
-                                () => {
-                                    const isVisible = (el) => {
-                                        if (!el) return false;
-                                        const style = window.getComputedStyle(el);
-                                        return style.display !== 'none' && 
-                                               style.visibility !== 'hidden' && 
-                                               el.offsetWidth > 0 && 
-                                               el.offsetHeight > 0;
-                                    };
-                                    
-                                    // Find and return the search element
-                                    const textareas = Array.from(document.querySelectorAll('textarea'));
-                                    for (const textarea of textareas) {
-                                        if (isVisible(textarea)) {
-                                            const placeholder = textarea.getAttribute('placeholder') || '';
-                                            if (placeholder.toLowerCase().includes('ask') || 
-                                                placeholder.toLowerCase().includes('anything')) {
-                                                return textarea;
-                                            }
-                                        }
-                                    }
-                                    
-                                    const contenteditables = Array.from(document.querySelectorAll('[contenteditable="true"]'));
-                                    for (const div of contenteditables) {
-                                        if (isVisible(div)) {
-                                            const text = div.textContent || '';
-                                            if (text.toLowerCase().includes('ask anything') ||
-                                                text.toLowerCase().includes('ask')) {
-                                                return div;
-                                            }
-                                        }
-                                    }
-                                    
-                                    // Fallback
-                                    for (const textarea of textareas) {
-                                        if (isVisible(textarea) && !textarea.disabled) {
-                                            return textarea;
-                                        }
-                                    }
-                                    
-                                    return null;
-                                }
-                            """)
-                            
-                            if js_handle:
-                                # Convert JSHandle to ElementHandle
-                                if isinstance(js_handle, ElementHandle):
-                                    search_box = js_handle
-                                elif hasattr(js_handle, 'as_element'):
-                                    search_box = js_handle.as_element()
-                                else:
-                                    # Try to use it directly if it's already an element handle
-                                    search_box = js_handle
-                        except Exception as e:
-                            print(f"  evaluate_handle failed: {e}", flush=True)
-                        
-        except Exception as e:
-            last_error = f"JavaScript search failed: {str(e)}"
-            print(f"  JavaScript search failed: {e}", flush=True)
-        
-        # Fallback to traditional selector approach if JavaScript failed
-        if not search_box:
-            print("  JavaScript approach failed, trying traditional selectors...", flush=True)
-            search_selectors = [
-                # Contenteditable divs (modern UI)
-                'div[contenteditable="true"]',
-                '[contenteditable="true"]',
-                # Textareas
-                'textarea[placeholder*="Ask anything"]',
-                'textarea[placeholder*="ask anything"]',
-                'textarea[placeholder*="Ask"]',
-                'textarea',
-                # Inputs
-                'input[type="text"]',
-                'input[type="search"]',
-            ]
-            
-            for selector in search_selectors:
-                try:
-                    print(f"    Trying: {selector}", flush=True)
-                    search_box = self.page.wait_for_selector(selector, timeout=2000, state="visible")
-                    if search_box and search_box.is_visible():
-                        # Verify it's the right element
-                        try:
-                            text = search_box.inner_text() or ''
-                            placeholder = search_box.get_attribute('placeholder') or ''
-                            if 'ask' in text.lower() or 'ask' in placeholder.lower() or selector == 'textarea':
-                                print(f"  ✓ Found search box with: {selector}", flush=True)
-                                break
-                        except:
-                            pass
-                    else:
-                        search_box = None
-                except Exception as e:
-                    last_error = str(e)
-                    continue
+        for selector in search_selectors:
+            try:
+                search_box = target_page.wait_for_selector(selector, timeout=3000, state="visible")
+                if search_box:
+                    break
+            except Exception:
+                continue
         
         if not search_box:
-            # Take screenshot for debugging
-            try:
-                screenshot_path = "debug_search_failed.png"
-                self.page.screenshot(path=screenshot_path, full_page=True)
-                print(f"  Debug screenshot saved: {screenshot_path}", flush=True)
-            except Exception as e:
-                print(f"  Could not save screenshot: {e}", flush=True)
-            
-            # Get page title and URL for debugging
-            try:
-                title = self.page.title()
-                url = self.page.url
-                print(f"  Page title: {title}", flush=True)
-                print(f"  Page URL: {url}", flush=True)
-            except:
-                pass
-            
-            raise Exception(
-                f"Could not find search input.\n"
-                f"Last error: {last_error}\n"
-                f"Page may not be fully loaded or structure changed.\n"
-                f"Check debug_search_failed.png for visual debugging.\n"
-                f"Make sure you're logged in and on the Perplexity homepage."
-            )
-        
-        # Determine element type and handle accordingly
-        try:
-            element_tag = search_box.evaluate("el => el.tagName.toLowerCase()")
-            is_contenteditable = search_box.evaluate("el => el.contentEditable === 'true'")
-        except:
-            # Fallback: check tag name via attribute
-            try:
-                tag_name = search_box.evaluate("el => el.tagName")
-                element_tag = tag_name.lower() if tag_name else 'textarea'
-                is_contenteditable = False
-            except:
-                element_tag = 'textarea'
-                is_contenteditable = False
-        
-        # Network monitoring is already set up in start() if debug_network is enabled
-        
-        # Click to focus first (important for all UIs)
-        try:
-            search_box.click()
-            time.sleep(0.1)  # Minimal wait
-        except:
-            pass
+            raise Exception("Could not find search input. Make sure you're logged in.")
         
         # Clear any existing text and enter query
-        print(f"  Entering query...", flush=True)
-        
-        if is_contenteditable or element_tag == 'div':
-            # Handle contenteditable divs - optimized for speed
-            try:
-                # Clear and type in one go
-                search_box.evaluate(f"""
-                    (el) => {{
-                        el.focus();
-                        el.textContent = '';
-                        el.innerText = '';
-                    }}
-                """)
-                # Type faster (30ms delay instead of 50ms)
-                search_box.type(query, delay=30)
-                
-                # Trigger events immediately
-                search_box.evaluate("""
-                    (el) => {
-                        const inputEvent = new Event('input', { bubbles: true });
-                        el.dispatchEvent(inputEvent);
-                        const changeEvent = new Event('change', { bubbles: true });
-                        el.dispatchEvent(changeEvent);
-                    }
-                """)
-            except Exception as e:
-                # Fallback: use JavaScript to set content directly
-                search_box.evaluate(f"""
-                    (el) => {{
-                        el.focus();
-                        el.innerHTML = '';
-                        el.textContent = '{query}';
-                        el.innerText = '{query}';
-                        const event = new Event('input', {{ bubbles: true }});
-                        el.dispatchEvent(event);
-                    }}
-                """)
-        else:
-            # Handle textarea/input with standard methods
-            try:
-                search_box.clear()
-            except:
-                pass
+        # Use Playwright's fill() method which works well with contenteditable divs
+        try:
+            search_box.click()  # Focus the element
+            target_page.wait_for_timeout(200)  # Increased wait for focus (more human-like)
             
-        search_box.fill(query)
+            # Use fill() method - works with contenteditable divs
+            # But add a small delay to simulate human typing
+            search_box.fill(query)
+            
+            # Wait longer to ensure input is processed and looks more human
+            target_page.wait_for_timeout(500)  # Increased from 100ms to 500ms
+            
+        except Exception as e:
+            # Fallback: try type() method if fill() fails
+            try:
+                target_page.keyboard.press('Control+A')  # Select all
+                target_page.wait_for_timeout(50)
+                search_box.type(query, delay=10)
+                target_page.wait_for_timeout(100)
+            except Exception:
+                # Last resort: JavaScript method
+                try:
+                    target_page.evaluate("""
+                        (query) => {
+                            const el = document.querySelector('#ask-input') || 
+                                      document.querySelector('[contenteditable="true"]');
+                        if (el) {
+                            el.focus();
+                                const p = el.querySelector('p');
+                                if (p) {
+                                    p.textContent = query;
+                                } else {
+                            el.textContent = query;
+                                }
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                                el.dispatchEvent(new Event('change', { bubbles: true }));
+                            }
+                        }
+                    """, query)
+                    target_page.wait_for_timeout(100)
+                except Exception:
+                    raise Exception(f"Failed to enter query into search box: {str(e)}")
         
-        # Press Enter to submit
-        print(f"  Submitting query...", flush=True)
-        search_box.press('Enter')
+        # Submit - try clicking submit button first, fallback to Enter
+        # Add a small delay before submitting to look more human
+        target_page.wait_for_timeout(300)  # Wait before submitting
+        
+        try:
+            # Look for submit button
+            submit_button = target_page.query_selector('button[data-testid="submit-button"], button:has-text("Submit")')
+            if submit_button and submit_button.is_visible():
+                submit_button.click()
+            else:
+                # Fallback: press Enter
+                search_box.press('Enter')
+        except Exception:
+            # Fallback: press Enter
+            search_box.press('Enter')
+        
+        # Wait a moment after submitting before checking for response
+        target_page.wait_for_timeout(1000)  # Wait 1 second after submit
+        
+        # Capture the state BEFORE the new search to identify which answer is new
+        # This helps when multiple queries are on the same page
+        answer_containers_before = []
+        try:
+            answer_containers_before = target_page.evaluate("""
+                () => {
+                    const main = document.querySelector('main');
+                    if (!main) return [];
+                    
+                    // Find all answer containers (sections that look like answers)
+                    const containers = main.querySelectorAll('div, section, article');
+                    const answerSections = [];
+                    
+                    for (const container of containers) {
+                        const text = (container.innerText || container.textContent || '').trim();
+                        // Skip UI elements and very short containers
+                        if (text.length > 200 && 
+                            !text.toLowerCase().includes('source') && 
+                            !text.toLowerCase().includes('related question') &&
+                            !text.toLowerCase().includes('ask a follow-up')) {
+                            // Get a unique identifier for this container
+                            const rect = container.getBoundingClientRect();
+                            answerSections.push({
+                                top: rect.top,
+                                textLength: text.length,
+                                firstWords: text.substring(0, 50)
+                            });
+                        }
+                    }
+                    
+                    return answerSections;
+                }
+            """)
+        except Exception:
+            pass
         
         if wait_for_response:
-            # Wait for response using smart detection
-            print("Waiting for response...", flush=True)
+            # Wait for response using optimized strategy
+            # First, wait for URL to change to search page (indicates search started)
+            # Add initial delay to let the request start
+            target_page.wait_for_timeout(500)  # Wait 500ms before checking URL
+            
             try:
-                # Wait for response container to appear (optimized timeout)
-                response_selectors = [
-                    '.prose',
-                    '[class*="answer"]',
-                    '[class*="response"]',
-                    '[class*="result"]',
-                    '[class*="output"]',
-                    '[data-testid*="answer"]',
-                    '[data-testid*="response"]',
-                    'main article',
-                    '[role="article"]',
-                ]
-                
-                response_found = False
-                for selector in response_selectors:
+                # Wait for URL to change to /search/ pattern
+                target_page.wait_for_function(
+                    "() => window.location.pathname.startsWith('/search/')",
+                    timeout=10000
+                )
+                logger.debug("Search initiated - URL changed to search page")
+                # Wait for main element to be present before starting content checks
+                target_page.wait_for_selector('main', timeout=5000)
+                target_page.wait_for_timeout(800)  # Brief wait for content to start loading
+            except Exception:
+                # Fallback: wait for any URL change or content
+                try:
+                    target_page.wait_for_function(
+                        "() => window.location.pathname !== '/' || document.querySelector('main')?.textContent?.length > 100",
+                        timeout=5000
+                    )
+                except Exception:
+                    pass  # Continue even if URL doesn't change
+            
+            # Wait for response using adaptive polling with Playwright's wait_for_function
+            max_wait_time = min(timeout / 1000, 40)  # Cap at 40 seconds max - allow time for comprehensive answers
+            start_time = time.time()
+            response_text = ""
+            check_interval = 0.3  # Start with fast polling (300ms)
+            stable_count = 0
+            previous_length = 0
+            no_progress_count = 0
+            max_no_progress = 100  # Allow up to 30 seconds (100 checks * 0.3s avg) for answer generation
+            
+            # Track answer completion using button state
+            answer_complete = False  # Track if answer is complete
+            
+            while (time.time() - start_time) < max_wait_time:
+                try:
+                    current_url = target_page.url
+                    if 'perplexity.ai' not in current_url.lower():
+                        raise Exception(f"Redirected away from Perplexity: {current_url}")
+                    
+                    # Check for Cloudflare challenge during search
                     try:
-                        # Shorter timeout per selector
-                        self.page.wait_for_selector(selector, timeout=3000, state="visible")
-                        response_found = True
-                        print(f"  ✓ Response container found", flush=True)
-                        break
-                    except:
-                        continue
-                
-                if not response_found:
-                    # Try one more time with a longer wait
-                    try:
-                        self.page.wait_for_selector('.prose, [class*="answer"], main article', timeout=5000, state="visible")
-                        response_found = True
-                    except:
+                        has_cloudflare = target_page.evaluate("""
+                            () => {
+                                const bodyText = document.body.textContent || '';
+                                return bodyText.includes('just a moment') || 
+                                       bodyText.includes('checking your browser') ||
+                                       bodyText.includes('Please wait');
+                            }
+                        """)
+                        if has_cloudflare:
+                            logger.debug("Cloudflare challenge detected during search, waiting...")
+                            target_page.wait_for_timeout(2000)
+                            continue
+                    except Exception:
                         pass
-                
-                if response_found:
-                    # Wait for initial rendering (Perplexity streams content)
-                    print("  Waiting for content to render...", flush=True)
-                    time.sleep(3)  # Give time for initial content to appear
-                
-                # Wait for response text to stabilize and fully render
-                response_text = ""
-                previous_length = 0
-                stable_count = 0
-                growing_count = 0
-                max_wait_time = timeout / 1000  # Convert to seconds
-                start_time = time.time()
-                check_interval = 0.8  # Check every 800ms (slightly longer for rendering)
-                
-                print("  Monitoring response completion...", flush=True)
-                
-                while (time.time() - start_time) < max_wait_time:
-                    current_text = self.get_response_text()
-                    current_length = len(current_text) if current_text else 0
                     
-                    if current_text:
-                        # Check if text is growing (still streaming/rendering)
-                        if current_length > previous_length:
-                            growing_count += 1
-                            stable_count = 0  # Reset stability counter
-                            length_diff = current_length - previous_length
-                            response_text = current_text
-                            if self.debug_network:
-                                print(f"    Text growing: {current_length} chars (+{length_diff})", flush=True)
-                            previous_length = current_length
-                        # Check if text is stable (not changing)
-                        elif current_text == response_text:
-                            stable_count += 1
-                            # Wait for 5 seconds of stability (6-7 checks) to ensure rendering is complete
-                            if stable_count >= 6:
-                                print(f"  ✓ Response stable for {stable_count * check_interval:.1f}s", flush=True)
-                                break
-                        else:
-                            # Text changed but length same (content reformatted)
-                            stable_count = 0
-                            response_text = current_text
-                            previous_length = current_length
-                    else:
-                        # No text yet, keep waiting
-                        stable_count = 0
-                        growing_count = 0
-                    
-                    time.sleep(check_interval)
-                
-                # Final extraction with a bit more wait for any final rendering
-                if response_text:
-                    time.sleep(1)  # One more second for final render
-                    final_text = self.get_response_text()
-                    if final_text and len(final_text) > len(response_text):
-                        response_text = final_text
-                
-                if response_text:
-                    print(f"✓ Response received ({len(response_text)} chars)", flush=True)
-                    return response_text
-                else:
-                    print("⚠ Response container found but no text extracted", flush=True)
-                    print("  Response may still be loading or format changed", flush=True)
-                    return ""
-                
-            except Exception as e:
-                print(f"Timeout or error waiting for response: {e}", flush=True)
-                # Try to get whatever text is available
-                response_text = self.get_response_text()
-                if response_text:
-                    print(f"✓ Partial response received ({len(response_text)} chars)", flush=True)
-                    return response_text
-                return ""
-    
-    def get_response_text(self) -> str:
-        """Extract response text from page using JavaScript for better extraction"""
-        if not self.page:
-            return ""
-        
-        # Extract ALL meaningful content from main element - maximal extraction
-        try:
-            response_data = self.page.evaluate("""
-                () => {
-                    // Get everything from main - it contains ALL response content
-                    const main = document.querySelector('main');
-                    if (!main) return '';
-                    
-                    // Get ALL text from main (includes answer, sections, sources, related questions)
-                    const allText = main.innerText || main.textContent || '';
-                    
-                    // UI keywords to filter out
-                    const uiKeywords = [
-                        'Home', 'Travel', 'Academic', 'Sports', 'Library', 'Discover', 
-                        'Spaces', 'Finance', 'Account', 'Upgrade', 'Install', 'Share',
-                        'Download Comet', 'View All', 'Ask a follow-up', 'Answer', 'Images'
-                    ];
-                    
-                    const lines = allText.split('\\n');
-                    const filtered = [];
-                    const seenLines = new Set(); // Track duplicates
-                    const seenShortLines = new Set(); // Track short repeated lines (likely navigation)
-                    let foundContentStart = false; // Track when we hit actual content
-                    
-                    // Patterns to detect navigation/bookmarks/JS code
-                    const bookmarkPattern = /^(function\(|window\.open|Bookmarks|View All|Download Comet)/i;
-                    const jsCodePattern = /^(function|const |let |var |window\.|document\.|\(function\(\))/i;
-                    const repeatedQueryPattern = /^(What is|How does|Tell me about|Explain)/i; // Common query starters
-                    
-                    for (const line of lines) {
-                        const trimmed = line.trim();
-                        if (!trimmed) {
-                            // Keep empty lines if we've found content (formatting)
-                            if (foundContentStart) {
-                                filtered.push('');
-                            }
-                            continue;
-                        }
-                        
-                        // Filter single-word exact UI matches
-                        const words = trimmed.split(/\\s+/);
-                        const isSingleWordUI = words.length === 1 && uiKeywords.some(kw => 
-                            trimmed.toLowerCase() === kw.toLowerCase());
-                        
-                        if (isSingleWordUI) continue;
-                        
-                        // Skip bookmark/JavaScript code patterns
-                        if (bookmarkPattern.test(trimmed) || jsCodePattern.test(trimmed)) {
-                            continue;
-                        }
-                        
-                        // Skip if it looks like JavaScript code (contains common JS patterns)
-                        if (trimmed.includes('function(') || trimmed.includes('window.open') || 
-                            trimmed.includes('encodeURIComponent') || trimmed.includes('toLocaleDateString')) {
-                            continue;
-                        }
-                        
-                        // Skip "Bookmarks", "View All", "Download Comet" even if not single word
-                        if (trimmed === 'Bookmarks' || trimmed === 'View All' || trimmed === 'Download Comet') {
-                            continue;
-                        }
-                        
-                        // Skip duplicate short lines (like repeated queries from search history)
-                        const lineLower = trimmed.toLowerCase();
-                        
-                        // Before content starts: skip ALL duplicates and short lines that look like queries
-                        if (!foundContentStart) {
-                            if (trimmed.length < 60) {
-                                // Skip if it's a duplicate or looks like a query/question
-                                if (seenLines.has(lineLower) || 
-                                    trimmed.endsWith('?') || 
-                                    repeatedQueryPattern.test(trimmed) ||
-                                    words.length <= 6) {
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // After content starts: only skip exact duplicates of very short lines
-                            if (trimmed.length < 30 && seenShortLines.has(lineLower)) {
-                                continue;
-                            }
-                            if (trimmed.length < 50) {
-                                seenShortLines.add(lineLower);
-                            }
-                        }
-                        
-                        // Mark when we start seeing actual content (not just navigation)
-                        // Look for longer lines, sentences, or content indicators
-                        if (!foundContentStart) {
-                            // Real content indicators:
-                            // - Long lines (>50 chars)
-                            // - Lines with multiple sentences (periods, commas)
-                            // - Lines with citations (contains + or numbers like "ibm+2")
-                            // - Lines starting with capital letters and having substantial length
-                            const hasContent = trimmed.length > 50 || 
-                                             (trimmed.match(/[.,;]/g) && trimmed.match(/[.,;]/g).length > 1) ||
-                                             /\\+\\d+/.test(trimmed) || // Citation pattern like "ibm+2"
-                                             (/^[A-Z]/.test(trimmed) && trimmed.length > 30);
-                            
-                            if (hasContent) {
-                                foundContentStart = true;
-                            }
-                        }
-                        
-                        seenLines.add(lineLower);
-                        filtered.push(trimmed);
-                    }
-                    
-                    let result = filtered.join('\\n').trim();
-                    
-                    // Clean up leading navigation items if still present
-                    const resultLines = result.split('\\n');
-                    let contentStartIdx = 0;
-                    for (let i = 0; i < resultLines.length; i++) {
-                        const line = resultLines[i].trim();
-                        // Look for start of actual content (long lines, starts with capital, has content)
-                        if (line.length > 50 || /^[A-Z]/.test(line) && line.length > 20) {
-                            contentStartIdx = i;
-                            break;
-                        }
-                    }
-                    if (contentStartIdx > 0) {
-                        result = resultLines.slice(contentStartIdx).join('\\n').trim();
-                    }
-                    
-                    // Extract all external links (sources) - comprehensive extraction
-                    const links = [];
-                    const seenUrls = new Set();
-                    
-                    // Find ALL links in main first
-                    const allLinks = main.querySelectorAll('a[href]');
-                    
-                    allLinks.forEach(link => {
-                        const href = link.getAttribute('href');
-                        if (!href) return;
-                        
-                        // Normalize href
-                        let url = href;
-                        if (url.startsWith('//')) {
-                            url = 'https:' + url;
-                        } else if (url.startsWith('/') && !url.startsWith('//')) {
-                            // Skip internal Perplexity links (unless they're absolute)
-                            if (!url.includes('http')) return;
-                            url = 'https://www.perplexity.ai' + url;
-                        }
-                        
-                        // Only include external HTTP links
-                        if (url.startsWith('http') && 
-                            !url.includes('perplexity.ai') && 
-                            !url.includes('facebook.com') && 
-                            !url.includes('twitter.com') &&
-                            !url.includes('x.com') &&
-                            !url.includes('linkedin.com') &&
-                            !url.includes('pinterest.com') &&
-                            !seenUrls.has(url)) {
-                            
-                            seenUrls.add(url);
-                            
-                            // Comprehensive link text extraction
-                            let text = '';
-                            
-                            // Method 1: Direct link text
-                            text = (link.innerText || link.textContent || '').trim();
-                            
-                            // Method 2: Attributes
-                            if (!text || text.length < 2) {
-                                text = (link.getAttribute('title') || 
-                                       link.getAttribute('aria-label') || 
-                                       link.getAttribute('data-title') || '').trim();
-                            }
-                            
-                            // Method 3: Parent element text (common pattern)
-                            if (!text || text.length < 2) {
-                                const parent = link.parentElement;
-                                if (parent) {
-                                    // Get all text from parent
-                                    const parentText = (parent.innerText || parent.textContent || '').trim();
-                                    // Remove the URL from parent text
-                                    let cleanText = parentText.replace(url, '').replace(href, '').trim();
-                                    
-                                    // If parent has multiple children, try to get just the text parts
-                                    if (cleanText.length > 200) {
-                                        // Look for specific text elements
-                                        const textElements = parent.querySelectorAll('span, div, p, h1, h2, h3, h4');
-                                        for (const el of textElements) {
-                                            const elText = (el.innerText || el.textContent || '').trim();
-                                            if (elText.length > 5 && elText.length < 200 && !elText.includes(url)) {
-                                                cleanText = elText;
-                                                break;
-                                            }
+                    # OPTIMIZED: Check button state AND content in ONE evaluate() call
+                    try:
+                        page_state = target_page.evaluate("""
+                            () => {
+                                // Check buttons (most reliable completion indicator)
+                                const stopButton = document.querySelector('button[data-testid="stop-generating-response-button"]');
+                                const submitButton = document.querySelector('button[data-testid="submit-button"]');
+                                
+                                // Check for content in parallel
+                                const main = document.querySelector('main');
+                                let hasContent = false;
+                                if (main) {
+                                    const paragraphs = main.querySelectorAll('p');
+                                    for (const p of paragraphs) {
+                                        const text = (p.innerText || p.textContent || '').trim();
+                                        if (text.length > 100 && !text.includes('Sign in or create')) {
+                                            hasContent = true;
+                                            break;
                                         }
-                                    }
-                                    
-                                    if (cleanText.length > 2 && cleanText.length < 200) {
-                                        text = cleanText;
-                                    }
-                                }
-                            }
-                            
-                            // Method 4: Previous/next sibling elements
-                            if (!text || text.length < 2) {
-                                // Check previous sibling
-                                const prevSibling = link.previousElementSibling;
-                                if (prevSibling) {
-                                    const prevText = (prevSibling.innerText || prevSibling.textContent || '').trim();
-                                    if (prevText.length > 2 && prevText.length < 200) {
-                                        text = prevText;
                                     }
                                 }
                                 
-                                // Check next sibling
-                                if (!text || text.length < 2) {
-                                    const nextSibling = link.nextElementSibling;
-                                    if (nextSibling) {
-                                        const nextText = (nextSibling.innerText || nextSibling.textContent || '').trim();
-                                        if (nextText.length > 2 && nextText.length < 200) {
-                                            text = nextText;
+                                return {
+                                    isGenerating: stopButton !== null,
+                                    isComplete: submitButton !== null && stopButton === null,
+                                    hasContent: hasContent
+                                };
+                            }
+                        """)
+                        
+                        is_generating = page_state.get('isGenerating', False)
+                        is_complete = page_state.get('isComplete', False)
+                        has_content = page_state.get('hasContent', False)
+                        
+                        if is_complete:
+                            logger.info("✓ Answer complete detected - submit button visible, stop button gone")
+                            answer_complete = True
+                            # Wait briefly to ensure DOM is fully updated
+                            target_page.wait_for_timeout(300)  # Reduced from 500ms
+                            logger.debug("Waited 300ms for DOM to settle after completion")
+                            # Answer is complete - break out of loop immediately
+                            break
+                        elif is_generating:
+                            logger.debug("⏳ Answer still generating - stop button visible")
+                            answer_complete = False
+                            if has_content:
+                                logger.debug("Found content while generating")
+                        else:
+                            # No buttons yet, might be initial loading
+                            answer_complete = False
+                            
+                    except Exception as e:
+                        logger.debug(f"Page state check error: {str(e)[:100]}")
+                        # Fallback: assume no content
+                        has_content = False
+                        answer_complete = False
+                    
+                    if has_content:
+                        # Extract text - but only for the NEW answer (not previous ones)
+                        original_page = self.page
+                        self.page = target_page
+                        # Pass the query and previous answer info to extract only the new answer
+                        current_text = self.get_response_text(
+                            extract_images=extract_images, 
+                            image_dir=image_dir,
+                            query=query,
+                            previous_answers=answer_containers_before
+                        )
+                        self.page = original_page
+                        
+                        current_length = len(current_text) if current_text else 0
+                        
+                        if current_text:
+                            # Check if we got actual answer content, not just query text
+                            query_lower = query.lower()
+                            text_lower = current_text.lower()
+                            is_just_query = (text_lower.startswith(query_lower[:50]) and 
+                                           current_length < len(query) + 200)
+                            
+                            if is_just_query:
+                                # This is just the query, not the answer - wait for actual answer
+                                no_progress_count += 1
+                                check_interval = 0.5  # Slower when waiting for first content
+                            elif current_length > previous_length:
+                                # OPTIMIZATION: Answer is growing - poll aggressively
+                                response_text = current_text
+                                previous_length = current_length
+                                stable_count = 0
+                                no_progress_count = 0
+                                check_interval = 0.15  # Fast polling when actively generating (150ms)
+                            elif current_text == response_text:
+                                stable_count += 1
+                                no_progress_count = 0
+                                check_interval = 0.8  # Slower when content is stable
+                                # If answer is complete (button state), break immediately
+                                if answer_complete:
+                                    logger.info("Answer complete and stable - breaking immediately")
+                                    break
+                                # DON'T break on stability alone - wait for button state to confirm completion
+                                # The old logic here was breaking too early
+                                if stable_count >= 10:  # Only break after 5 seconds of no change (10 * 0.5s)
+                                    logger.warning(f"Content stable for {stable_count} checks but answer_complete={answer_complete}")
+                                    # Still don't break - let button state be authoritative
+                            else:
+                                response_text = current_text
+                                previous_length = current_length
+                                stable_count = 0
+                                no_progress_count = 0
+                        else:
+                            no_progress_count += 1
+                            # Don't break on no progress - could be slow generation or network delay
+                            # Let the button state be authoritative
+                            if no_progress_count >= max_no_progress:
+                                logger.debug(f"No progress for {no_progress_count} checks, but continuing to wait for button state")
+                    else:
+                        no_progress_count += 1
+                        # Don't break here either - wait for button state confirmation
+                        if no_progress_count >= max_no_progress and response_text:
+                            logger.debug(f"Content appears stable after {no_progress_count} checks, but waiting for button state confirmation")
+                        
+                except Exception as e:
+                    if "Redirected away" in str(e):
+                        raise
+                    # Log other exceptions but continue
+                    if "Target page" not in str(e) and "closed" not in str(e).lower():
+                        logger.debug(f"Warning during search wait: {str(e)[:100]}")
+                    pass
+                
+                # Adaptive sleep based on state
+                target_page.wait_for_timeout(int(check_interval * 1000))
+            
+            # Final check: Verify answer is complete using button state
+            if response_text:
+                logger.info(f"Answer detected with {len(response_text)} characters, verifying completion...")
+                try:
+                    # One final button check to ensure answer is complete
+                    button_state = target_page.evaluate("""
+                        () => {
+                            const stopButton = document.querySelector('button[data-testid="stop-generating-response-button"]');
+                            const submitButton = document.querySelector('button[data-testid="submit-button"]');
+                            return {
+                                isGenerating: stopButton !== null,
+                                isComplete: submitButton !== null && stopButton === null,
+                                hasStopButton: stopButton !== null,
+                                hasSubmitButton: submitButton !== null
+                            };
+                        }
+                    """)
+                    
+                    logger.debug(f"Button state: {button_state}")
+                    is_complete = button_state.get('isComplete', False)
+                    is_generating = button_state.get('isGenerating', False)
+                    
+                    if is_generating and not is_complete:
+                        # Answer is STILL generating - we exited loop too early (timeout?)
+                        logger.warning("⚠ Answer still generating! Waiting for completion...")
+                        logger.info(f"Current answer length: {len(response_text)}, waiting up to 30 more seconds...")
+                        
+                        # Wait for generation to complete (up to 30 seconds)
+                        additional_wait = 30
+                        for i in range(additional_wait * 2):  # Check every 0.5 seconds
+                            target_page.wait_for_timeout(500)
+                            button_state = target_page.evaluate("""
+                                () => {
+                                    const stopButton = document.querySelector('button[data-testid="stop-generating-response-button"]');
+                                    const submitButton = document.querySelector('button[data-testid="submit-button"]');
+                                    return {
+                                        isGenerating: stopButton !== null,
+                                        isComplete: submitButton !== null && stopButton === null
+                                    };
+                                }
+                            """)
+                            if button_state.get('isComplete', False):
+                                logger.info(f"✓ Answer completed after {(i+1)*0.5} additional seconds")
+                                is_complete = True
+                                break
+                        
+                        if not is_complete:
+                            logger.error("Answer still generating after 30 additional seconds - returning partial answer")
+                    
+                    if is_complete:
+                        logger.info("✓ Final check confirms answer is complete")
+                        # Wait a bit more to ensure everything is rendered
+                        target_page.wait_for_timeout(1000)
+                        logger.debug("Waited 1s for final rendering")
+                        # Extract final version
+                        original_page = self.page
+                        self.page = target_page
+                        final_text = self.get_response_text(
+                            extract_images=extract_images, 
+                            image_dir=image_dir,
+                            query=query,
+                            previous_answers=answer_containers_before
+                        )
+                        self.page = original_page
+                        if final_text and len(final_text) > len(response_text):
+                            logger.info(f"Final extraction improved: {len(response_text)} -> {len(final_text)} characters")
+                            response_text = final_text
+                        else:
+                            logger.debug(f"Final extraction didn't improve length: {len(final_text)} vs {len(response_text)}")
+                        logger.info(f"✓ Final answer length: {len(response_text)} characters")
+                    else:
+                        logger.error(f"❌ Answer incomplete - returning partial result: {button_state}")
+                except Exception as e:
+                    logger.error(f"Final check error: {str(e)[:100]}")
+            
+            # Final check: if we have a search URL but no content, wait a bit more
+            if not response_text:
+                current_url = target_page.url
+                if '/search/' in current_url:
+                    logger.debug("On search page but no content detected, waiting 5 more seconds...")
+                    target_page.wait_for_timeout(5000)
+                    # Try one more extraction
+                    try:
+                        original_page = self.page
+                        self.page = target_page
+                        current_text = self.get_response_text(
+                            extract_images=extract_images, 
+                            image_dir=image_dir,
+                            query=query,
+                            previous_answers=answer_containers_before
+                        )
+                        self.page = original_page
+                        if current_text and len(current_text) > 50:
+                            response_text = current_text
+                    except Exception:
+                        pass
+            
+            # Extract final response
+            if response_text:
+                logger.info(f"search: Extracting final response (structured={structured}), response_text length: {len(response_text)}")
+                original_page = self.page
+                self.page = target_page
+                
+                if structured:
+                    logger.debug("search: Calling get_structured_response...")
+                    result: Dict[str, Any] = self.get_structured_response(
+                        query, 
+                        extract_images=extract_images, 
+                        image_dir=image_dir,
+                        previous_answers=answer_containers_before
+                    )
+                    logger.info(f"search: Got structured result with answer length: {len(result.get('answer', ''))}")
+                else:
+                    result = response_text  # type: ignore
+                    logger.info(f"search: Returning plain text result, length: {len(result)}")
+                
+                self.page = original_page
+                logger.info("search: Returning result to caller")
+                return result
+            else:
+                logger.warning("search: No response_text extracted, returning empty result")
+            
+            empty_result = "" if not structured else {
+                'query': query,
+                'answer': '',
+                'sources': [],
+                'related_questions': [],
+                'mode': 'auto',
+                'model': None
+            }
+            logger.warning(f"search: Returning empty result (structured={structured})")
+            return empty_result
+        
+        logger.warning("search: wait_for_response=False, returning empty result")
+        return "" if not structured else {
+            'query': query,
+            'answer': '',
+            'sources': [],
+            'related_questions': [],
+            'mode': 'auto',
+            'model': None
+        }
+    
+    def get_response_text(
+        self, 
+        extract_images: bool = False, 
+        image_dir: Optional[str] = None,
+        query: Optional[str] = None,
+        previous_answers: Optional[List[Dict[str, Any]]] = None
+    ) -> str:
+        """
+        Extract response text matching the direct API method logic.
+        The API looks for answer content in specific structures:
+        - Main answer paragraphs (not sources, not related questions)
+        - Text content from answer sections
+        - Joins chunks appropriately
+        
+        Args:
+            extract_images: Whether to extract images
+            image_dir: Directory to save images
+            query: The current query being searched (to identify the correct answer)
+            previous_answers: List of previous answer containers to exclude
+        """
+        if not self.page:
+            logger.warning("get_response_text: page is None")
+            return ""
+        
+        logger.debug(f"get_response_text: Starting extraction for query: {query[:50] if query else 'None'}...")
+        
+        try:
+            # Pass previous answers and query as a single argument object
+            eval_args = {
+                'previousAnswers': previous_answers or [],
+                'queryText': query or ''
+            }
+            result = self.page.evaluate("""
+                (args) => {
+                    const previousAnswers = args.previousAnswers || [];
+                    const queryText = args.queryText || '';
+                    const main = document.querySelector('main');
+                    if (!main) {
+                        console.log('[ERROR] main element not found');
+                        return '';  // Return empty string instead of null
+                    }
+                    console.log('[DEBUG] main element found, extracting content...');
+                    
+                    // Find the main answer section - look for the answer content area
+                    // This should match how the API extracts from 'chunks' or 'structured_answer'
+                    let answerParts = [];
+                    
+                    // Strategy 1: Look for answer paragraphs (main content, not sources)
+                    // Find paragraphs that are part of the answer, not sources or related questions
+                    const allParagraphs = main.querySelectorAll('p');
+                    const answerParagraphs = [];
+                    
+                    for (const p of allParagraphs) {
+                        const text = (p.innerText || p.textContent || '').trim();
+                        // Skip very short paragraphs (likely UI elements)
+                        if (text.length < 50) continue;
+                        
+                        // Skip paragraphs that are clearly in sources or related sections
+                        let parent = p.parentElement;
+                        let isSourceOrRelated = false;
+                        while (parent && parent !== main) {
+                            const parentText = (parent.textContent || '').toLowerCase();
+                            const parentClass = (parent.className || '').toLowerCase();
+                            if (parentText.includes('source') || parentText.includes('related') ||
+                                parentClass.includes('source') || parentClass.includes('related')) {
+                                isSourceOrRelated = true;
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                        
+                        if (!isSourceOrRelated && text.length > 50) {
+                            answerParagraphs.push(text);
+                        }
+                    }
+                    
+                    // Strategy 2: Collect ALL answer containers - GET EVERYTHING, filter later
+                    // Don't filter aggressively - capture all content first
+                    // Only skip obvious UI states, not content
+                    const containers = main.querySelectorAll('div, section, article');
+                    let allAnswerContainers = [];
+                    let answerContainer = null;
+                    let maxTextLength = 0;
+                    let newestContainer = null;
+                    let newestTop = -1;
+                    
+                    for (const container of containers) {
+                        const text = (container.innerText || container.textContent || '').trim();
+                        const containerText = text.toLowerCase();
+                        
+                        // Only skip obvious UI states (thinking, searching)
+                        if (containerText.includes('thinking...') || 
+                            (containerText === 'searching' && text.length < 50) ||
+                            (containerText === 'exploring' && text.length < 50)) {
+                            continue;
+                        }
+                        
+                        // Skip if it's just a single word or very short (likely UI label)
+                        if (text.split(/\\s+/).length <= 1 && text.length < 20) continue;
+                        
+                        // Get container position first
+                        const rect = container.getBoundingClientRect();
+                        const containerTop = rect.top;
+                        const firstWords = text.substring(0, 50);
+                        
+                        // Check if this is a previous answer (skip it)
+                        let isPreviousAnswer = false;
+                        for (const prev of previousAnswers) {
+                            // If the first words match and position is similar, it's likely the same answer
+                            // Use a more lenient check - if position is close and text length is similar
+                            const positionDiff = Math.abs(containerTop - prev.top);
+                            const lengthDiff = Math.abs(text.length - prev.textLength);
+                            
+                            if (positionDiff < 200 && 
+                                (firstWords === prev.firstWords || lengthDiff < 100)) {
+                                isPreviousAnswer = true;
+                                break;
+                            }
+                        }
+                        
+                        if (isPreviousAnswer) continue;
+                        
+                        // Check if container contains query-related content (define before use)
+                        const containsQuery = queryText && text.toLowerCase().includes(queryText.toLowerCase().substring(0, 20));
+                        
+                        // GET EVERYTHING - minimal filtering, just collect all substantial containers
+                        // Only skip if it's clearly not answer content
+                        const textLines = text.split('\\n').filter(l => l.trim().length > 0);
+                        
+                        // Skip containers that are ONLY questions (related questions section)
+                        const questionLines = textLines.filter(l => l.trim().endsWith('?')).length;
+                        if (questionLines > 3 && questionLines / textLines.length > 0.8 && text.length < 500) {
+                            continue; // This is likely just related questions, skip it
+                        }
+                        
+                        // Collect ALL containers with substantial content - don't filter too much
+                        // Lower threshold to capture everything
+                        if (text.length > 100) {
+                            // Store container with its position and metadata
+                            allAnswerContainers.push({
+                                container: container,
+                                text: text,
+                                top: containerTop,
+                                length: text.length,
+                                containsQuery: containsQuery || false
+                            });
+                            
+                            // Also track for backward compatibility
+                            if (text.length > maxTextLength) {
+                                maxTextLength = text.length;
+                                answerContainer = container;
+                            }
+                        }
+                        
+                        // Track containers by position - newest answers appear lower on the page
+                        
+                        // Prefer containers that:
+                        // 1. Are not previous answers
+                        // 2. Are lower on the page (newer)
+                        // 3. Contain substantial content (including tables, lists, etc.)
+                        // 4. Optionally contain query-related keywords
+                        if (containerTop > newestTop && text.length > 200) {
+                            newestTop = containerTop;
+                            newestContainer = container;
+                        }
+                        
+                        // If this container contains query keywords and has substantial content, prefer it
+                        if (containsQuery && text.length > 200 && (!answerContainer || containsQuery)) {
+                            answerContainer = container;
+                            maxTextLength = text.length;
+                        }
+                    }
+                    
+                    // Log container discovery for debugging
+                    console.log(`[TELEMETRY] Found ${allAnswerContainers.length} potential answer containers`);
+                    for (let i = 0; i < Math.min(5, allAnswerContainers.length); i++) {
+                        const c = allAnswerContainers[i];
+                        console.log(`[TELEMETRY] Container ${i+1}: position=${Math.round(c.top)}, length=${c.length}, containsQuery=${c.containsQuery}, preview="${c.text.substring(0, 80).replace(/\\n/g, ' ')}..."`);
+                    }
+                    
+                    // Filter and sort all answer containers
+                    // Remove duplicates (containers that are parents/children of each other)
+                    const uniqueContainers = [];
+                    for (let i = 0; i < allAnswerContainers.length; i++) {
+                        const candidate = allAnswerContainers[i];
+                        let isDuplicate = false;
+                        
+                        // Check if this container is a child of another container we've already added
+                        for (let j = 0; j < uniqueContainers.length; j++) {
+                            const existing = uniqueContainers[j];
+                            if (existing.container.contains(candidate.container)) {
+                                // Candidate is a child of existing - skip it (existing has more content)
+                                isDuplicate = true;
+                                break;
+                            }
+                            if (candidate.container.contains(existing.container)) {
+                                // Existing is a child of candidate - replace it with candidate
+                                uniqueContainers[j] = candidate;
+                                isDuplicate = true;
+                                break;
+                            }
+                        }
+                        
+                        if (!isDuplicate) {
+                            uniqueContainers.push(candidate);
+                        }
+                    }
+                    
+                    // Sort by position (top to bottom) to maintain answer order
+                    uniqueContainers.sort((a, b) => a.top - b.top);
+                    
+                    console.log(`[TELEMETRY] After deduplication: ${uniqueContainers.length} unique containers`);
+                    
+                    // Filter to only include containers that are part of the current answer
+                    // Exclude containers that are too far apart (likely different answers)
+                    // But be more lenient to capture comprehensive answers
+                    const filteredContainers = [];
+                    if (uniqueContainers.length > 0) {
+                        // If we have containers, include them all if they're reasonably close
+                        // Start with the first container (or one containing query keywords)
+                        let startIndex = 0;
+                        for (let i = 0; i < uniqueContainers.length; i++) {
+                            if (uniqueContainers[i].containsQuery) {
+                                startIndex = i;
+                                break;
+                            }
+                        }
+                        
+                        filteredContainers.push(uniqueContainers[startIndex]);
+                        let lastTop = uniqueContainers[startIndex].top;
+                        
+                        // Add subsequent containers that are close enough (within 3000px vertically - more lenient)
+                        // This captures all parts of the same answer
+                        for (let i = startIndex + 1; i < uniqueContainers.length; i++) {
+                            const container = uniqueContainers[i];
+                            // If container is close to previous ones (same answer section)
+                            // OR if it has substantial content (even if further apart)
+                            // Be more lenient to capture comprehensive answers
+                            if (container.top - lastTop < 3000 || 
+                                (container.length > 300 && container.top - lastTop < 8000) ||
+                                (i < startIndex + 5)) { // Include at least first 5 containers
+                                filteredContainers.push(container);
+                                lastTop = container.top;
+                            } else if (container.length > 1000) {
+                                // Very large containers should be included even if further apart
+                                filteredContainers.push(container);
+                                lastTop = container.top;
+                            }
+                        }
+                    }
+                
+                // Convert to markdown preserving links, filtering out UI elements
+                // Define UI labels to skip - comprehensive list to remove bloat
+                const uiLabels = [
+                    'home', 'discover', 'library', 'pro', 'sign in', 'sign up', 
+                    'answer', 'images', 'sources', 'related', 'ask a follow-up', 
+                    'share', 'more', 'save', 'delete', 'edit', 'account', 'upgrade', 
+                    'install', 'download comet', 'deep dive on perplexity finance',
+                    'follow', 'price alert', 'prev close', '24h volume', 'high', 'open',
+                    'low', 'year high', 'year low', 'market cap'
+                ];
+                
+                // Define this function outside so it can be used in fallbacks too
+                const nodeToMarkdown = (node, depth = 0) => {
+                            // Skip UI labels and navigation elements
+                            if (node.nodeType === Node.ELEMENT_NODE) {
+                                const nodeText = (node.innerText || node.textContent || '').trim().toLowerCase();
+                                for (const label of uiLabels) {
+                                    if (nodeText === label || (nodeText.length < 50 && nodeText.includes(label))) {
+                                        return '';
+                                    }
+                                }
+                                // Skip if it's just a single word that's a common UI label
+                                if (nodeText.split(/\\s+/).length === 1 && nodeText.length < 20 && 
+                                    (nodeText === 'answer' || nodeText === 'images' || nodeText === 'sources')) {
+                                    return '';
+                                }
+                            }
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                return node.textContent || '';
+                            }
+                            if (node.nodeType !== Node.ELEMENT_NODE) {
+                                return '';
+                            }
+                            const tagName = node.tagName.toLowerCase();
+                            
+                            if (tagName === 'a') {
+                                const href = node.getAttribute('href');
+                                const text = (node.innerText || node.textContent || '').trim();
+                                if (href && text) {
+                                    let url = href;
+                                    if (url.startsWith('//')) {
+                                        url = 'https:' + url;
+                                    } else if (url.startsWith('/') && !url.startsWith('//')) {
+                                        if (url.includes('http')) {
+                                            url = 'https://www.perplexity.ai' + url;
+                                        } else {
+                                            return text;
+                                        }
+                                    }
+                                    if (url.startsWith('http') && !url.includes('perplexity.ai')) {
+                                        return `[${text}](${url})`;
+                                    }
+                                    return text;
+                                }
+                                return text || '';
+                            }
+                            
+                            if (tagName === 'p') {
+                                let content = '';
+                                for (const child of Array.from(node.childNodes)) {
+                                    content += nodeToMarkdown(child);
+                                }
+                                return content + '\\n\\n';
+                            }
+                            
+                            if (tagName === 'div') {
+                                let content = '';
+                                for (const child of Array.from(node.childNodes)) {
+                                    content += nodeToMarkdown(child, depth + 1);
+                                }
+                                // Only convert to heading if it's substantial content, not a UI label
+                                const text = (node.innerText || node.textContent || '').trim();
+                                const textLower = text.toLowerCase();
+                                // Skip if it's a UI label
+                                if (uiLabels.some(label => textLower === label || textLower.startsWith(label + ' '))) {
+                                    return content;
+                                }
+                                // Only make it a heading if it's substantial and looks like a real section
+                                if (text.length > 20 && text.length < 100 && text.endsWith(':')) {
+                                    return '\\n### ' + content.trim() + '\\n\\n';
+                                }
+                                return content + '\\n\\n';
+                            }
+                            
+                            if (tagName === 'h1' || tagName === 'h2' || tagName === 'h3' || tagName === 'h4') {
+                                let content = '';
+                                for (const child of Array.from(node.childNodes)) {
+                                    content += nodeToMarkdown(child, depth + 1);
+                                }
+                                const text = content.trim().toLowerCase();
+                                // Skip headings that are just UI labels
+                                if (uiLabels.some(label => text === label || text.startsWith(label + ' '))) {
+                                    return '';
+                                }
+                                // Only include if it's substantial content
+                                if (content.trim().length > 10) {
+                                    const level = parseInt(tagName.charAt(1));
+                                    const hashes = '#'.repeat(level + 2);  // h1 -> ###, h2 -> ####, etc.
+                                    return '\\n' + hashes + ' ' + content.trim() + '\\n\\n';
+                                }
+                                return '';
+                            }
+                            
+                            if (tagName === 'ul' || tagName === 'ol') {
+                                let content = '';
+                                let index = 1;
+                                for (const child of Array.from(node.childNodes)) {
+                                    if (child.tagName && child.tagName.toLowerCase() === 'li') {
+                                        const liContent = nodeToMarkdown(child);
+                                        if (tagName === 'ol') {
+                                            content += index + '. ' + liContent.trim() + '\\n';
+                                            index++;
+                                        } else {
+                                            content += '- ' + liContent.trim() + '\\n';
                                         }
                                     }
                                 }
+                                return content + '\\n';
                             }
                             
-                            // Method 5: Look for text nodes in the same container
-                            if (!text || text.length < 2) {
-                                const container = link.closest('div, article, section, li');
-                                if (container) {
-                                    // Get all text but exclude the link itself
-                                    const containerText = container.cloneNode(true);
-                                    // Remove the link from clone
-                                    const linkClone = containerText.querySelector('a[href="' + href + '"]');
-                                    if (linkClone) {
-                                        linkClone.remove();
-                                        const remainingText = (containerText.innerText || containerText.textContent || '').trim();
-                                        if (remainingText.length > 2 && remainingText.length < 300) {
-                                            text = remainingText;
+                            if (tagName === 'li') {
+                                let content = '';
+                                for (const child of Array.from(node.childNodes)) {
+                                    content += nodeToMarkdown(child);
+                                }
+                                return content.trim();
+                            }
+                            
+                            if (tagName === 'table') {
+                                let content = '';
+                                const rows = node.querySelectorAll('tr');
+                                for (const row of rows) {
+                                    const cells = row.querySelectorAll('td, th');
+                                    const rowContent = Array.from(cells).map(cell => {
+                                        const cellText = (cell.innerText || cell.textContent || '').trim();
+                                        return cellText;
+                                    }).filter(t => t.length > 0).join(' | ');
+                                    if (rowContent) {
+                                        content += rowContent + '\\n';
+                                        // Add separator after header row
+                                        if (row.querySelector('th')) {
+                                            content += Array.from(cells).map(() => '---').join(' | ') + '\\n';
                                         }
                                     }
                                 }
+                                return content + '\\n';
                             }
                             
-                            // Method 6: Look for nearby elements with class names containing "title", "name", "label"
-                            if (!text || text.length < 2) {
-                                const container = link.closest('div, article, section');
-                                if (container) {
-                                    const titleEl = container.querySelector('[class*="title"], [class*="name"], [class*="label"], h1, h2, h3, h4, h5, h6');
-                                    if (titleEl) {
-                                        const titleText = (titleEl.innerText || titleEl.textContent || '').trim();
-                                        if (titleText.length > 2 && titleText.length < 200) {
-                                            text = titleText;
-                                        }
-                                    }
+                            if (tagName === 'tr') {
+                                let content = '';
+                                const cells = node.querySelectorAll('td, th');
+                                const rowContent = Array.from(cells).map(cell => {
+                                    const cellText = (cell.innerText || cell.textContent || '').trim();
+                                    return cellText;
+                                }).filter(t => t.length > 0).join(' | ');
+                                return rowContent + '\\n';
+                            }
+                            
+                            if (tagName === 'td' || tagName === 'th') {
+                                let content = '';
+                                for (const child of Array.from(node.childNodes)) {
+                                    content += nodeToMarkdown(child);
+                                }
+                                return content.trim();
+                            }
+                            
+                            if (tagName === 'br') {
+                                return '\\n';
+                            }
+                            
+                            if (tagName === 'strong' || tagName === 'b') {
+                                let content = '';
+                                for (const child of Array.from(node.childNodes)) {
+                                    content += nodeToMarkdown(child);
+                                }
+                                return `**${content}**`;
+                            }
+                            
+                            if (tagName === 'em' || tagName === 'i') {
+                                let content = '';
+                                for (const child of Array.from(node.childNodes)) {
+                                    content += nodeToMarkdown(child);
+                                }
+                                return `*${content}*`;
+                            }
+                            
+                            let content = '';
+                            for (const child of Array.from(node.childNodes)) {
+                                content += nodeToMarkdown(child);
+                            }
+                            return content;
+                        };
+                
+                // Extract text from ALL answer containers (comprehensive extraction)
+                // This ensures we capture the entire answer, not just one container
+                if (filteredContainers.length > 0) {
+                    // Combine content from all containers in order
+                    const allTextParts = [];
+                    
+                    // Extract text from ALL containers and combine them
+                    for (const containerInfo of filteredContainers) {
+                        const container = containerInfo.container;
+                        let containerText = nodeToMarkdown(container);
+                        
+                        // Clean up the text
+                        containerText = containerText.replace(/\\n{3,}/g, '\\n\\n').trim();
+                        
+                        // Remove citation markers (like "source+1", "example.com+2")
+                        containerText = containerText.replace(/[a-zA-Z0-9.-]+\\+\\d+[^\\w\\s]*/g, '').trim();
+                        
+                        // Remove zero-width spaces and other problematic characters
+                        containerText = containerText.replace(/\\u200b/g, '').replace(/\\u200c/g, '').replace(/\\u200d/g, '');
+                        
+                        // GET EVERYTHING - but skip query text at the start
+                        const lines = containerText.split('\\n').filter(l => l.trim().length > 0);
+                        
+                        // Find where actual answer starts (skip query text and UI elements)
+                        let startIndex = 0;
+                        const queryStart = queryText ? queryText.toLowerCase().substring(0, 30) : '';
+                        
+                        for (let i = 0; i < Math.min(20, lines.length); i++) {
+                            const line = lines[i].trim().toLowerCase();
+                            
+                            // Skip if it's the query text
+                            if (queryStart && line.includes(queryStart) && line.length < 300) {
+                                continue;
+                            }
+                            
+                            // Skip obvious single-word UI labels
+                            const obviousUI = ['home', 'discover', 'spaces', 'finance', 'share', 'answer'];
+                            if (obviousUI.includes(line) && line.length < 20) {
+                                continue;
+                            }
+                            
+                            // If we find substantial content that's not the query, start from here
+                            if (line.length > 80 && (!queryStart || !line.includes(queryStart))) {
+                                startIndex = i;
+                                break;
+                            }
+                            
+                            // If we find answer markers, start from there
+                            if (line.includes('here is a') || 
+                                line.includes('latest cryptocurrency') ||
+                                line.includes('major news') ||
+                                line.includes('upcoming events') ||
+                                line.includes('market sentiment')) {
+                                startIndex = i;
+                                break;
+                            }
+                        }
+                        
+                        // Get all content from startIndex onwards - don't filter aggressively
+                        const cleanedText = lines.slice(startIndex).join('\\n').trim();
+                        
+                        // Additional cleanup: remove query text if it appears at the start
+                        let finalText = cleanedText;
+                        if (queryText && finalText.toLowerCase().startsWith(queryText.toLowerCase().substring(0, 50))) {
+                            // Find where the actual answer starts (after the query)
+                            const queryLines = queryText.toLowerCase().split('\\n');
+                            const firstQueryLine = queryLines[0].substring(0, Math.min(50, queryLines[0].length));
+                            const textLines = finalText.split('\\n');
+                            let answerStartIndex = 0;
+                            for (let i = 0; i < Math.min(10, textLines.length); i++) {
+                                const line = textLines[i].toLowerCase();
+                                // Skip lines that contain query text
+                                if (line.includes(firstQueryLine.substring(0, 30))) {
+                                    answerStartIndex = i + 1;
+                                } else if (answerStartIndex > 0 && line.length > 50) {
+                                    // Found first real content line after query
+                                    break;
                                 }
                             }
+                            if (answerStartIndex > 0) {
+                                finalText = textLines.slice(answerStartIndex).join('\\n').trim();
+                            }
+                        }
+                        
+                        if (finalText.length > 100) {
+                            allTextParts.push(finalText);
+                        }
+                    }
+                    
+                    console.log(`[TELEMETRY] Combining ${allTextParts.length} text parts into final answer`);
+                    for (let i = 0; i < allTextParts.length; i++) {
+                        console.log(`[TELEMETRY] Part ${i+1}: ${allTextParts[i].length} chars, preview="${allTextParts[i].substring(0, 80).replace(/\\n/g, ' ')}..."`);
+                    }
+                    
+                    // Combine all parts with proper spacing - GET EVERYTHING
+                    let combinedText = allTextParts.join('\\n\\n').trim();
+                    
+                    console.log(`[TELEMETRY] Combined text length: ${combinedText.length} characters`);
+                    
+                    // Minimal cleanup: just remove excessive newlines, keep all content
+                    combinedText = combinedText.replace(/\\n{4,}/g, '\\n\\n\\n').trim();
+                    
+                    // Remove duplicate content only if it's exact duplicates (containers overlap)
+                    const lines = combinedText.split('\\n');
+                    const finalLines = [];
+                    const seenExactLines = new Set();
+                    for (const line of lines) {
+                        const lineTrimmed = line.trim();
+                        // Only skip if it's an exact duplicate of a previous line
+                        if (lineTrimmed.length > 0) {
+                            if (!seenExactLines.has(lineTrimmed.toLowerCase())) {
+                                seenExactLines.add(lineTrimmed.toLowerCase());
+                                finalLines.push(line);
+                            } else if (lineTrimmed.length > 200) {
+                                // Keep long lines even if similar (might be important)
+                                finalLines.push(line);
+                            }
+                        }
+                    }
+                    
+                    return finalLines.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+                }
+                
+                // Fallback to single container if filteredContainers didn't work
+                // GET EVERYTHING - minimal filtering
+                if (answerContainer) {
+                    // Use the same nodeToMarkdown function (defined above)
+                    let allText = nodeToMarkdown(answerContainer);
+                    allText = allText.replace(/\\n{3,}/g, '\\n\\n').trim();
+                    allText = allText.replace(/[a-zA-Z0-9.-]+\\+\\d+[^\\w\\s]*/g, '').trim();
+                    allText = allText.replace(/\\u200b/g, '').replace(/\\u200c/g, '').replace(/\\u200d/g, '');
+                    // Keep everything - just remove excessive newlines
+                    return allText.replace(/\\n{4,}/g, '\\n\\n\\n').trim();
+                }
+                
+                // Fallback: If no container found, try to get all substantial content from main
+                // This handles cases where the answer is spread across multiple containers
+                if (!answerContainer && answerParagraphs.length > 0) {
+                    // Join paragraphs with double newlines for better formatting
+                    return answerParagraphs.join('\\n\\n').trim();
+                }
+                
+                // Last resort: Get all text from main, excluding sources and UI
+                if (!answerContainer) {
+                    const allText = (main.innerText || main.textContent || '').trim();
+                    // Filter out sources and related sections
+                    const lines = allText.split('\\n');
+                    const filteredLines = [];
+                    let inSourceSection = false;
+                    for (const line of lines) {
+                        const lineLower = line.toLowerCase().trim();
+                        if (lineLower.includes('source') || lineLower.includes('related question') ||
+                            lineLower.includes('ask a follow-up')) {
+                            inSourceSection = true;
+                            continue;
+                        }
+                        if (inSourceSection && line.trim().length < 50) {
+                            continue;
+                        }
+                        if (line.trim().length > 20) {
+                            filteredLines.push(line);
+                            inSourceSection = false;
+                        }
+                    }
+                    const finalText = filteredLines.join('\\n').trim();
+                    if (finalText.length > 200) {
+                        return finalText;
+                    }
+                }
+                
+                return '';
+                }
+            """, eval_args)
+            
+            if result:
+                logger.debug(f"get_response_text: Extracted {len(result)} characters")
+                # Show first 200 chars of result for debugging
+                preview = result[:200].replace('\n', ' ')
+                logger.debug(f"get_response_text: Preview: {preview}...")
+                return result
+            else:
+                logger.warning("get_response_text: JavaScript evaluation returned None or empty")
+        except Exception as e:
+            logger.error(f"Error extracting response text: {str(e)}")
+            import traceback
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
+            pass
+        
+        logger.warning("get_response_text: Returning empty string")
+        return ""
+    
+    def get_structured_response(
+        self,
+        query: str,
+        extract_images: bool = False,
+        image_dir: Optional[str] = None,
+        previous_answers: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
+        """
+        Extract structured response matching SearchResponse format.
+        Uses the same answer extraction logic as get_response_text (matching direct API method).
+        """
+        logger.debug(f"get_structured_response: Starting for query: {query[:50]}...")
+        
+        if not self.page:
+            logger.warning("get_structured_response: page is None")
+            return {
+                'query': query,
+                'answer': '',
+                'sources': [],
+                'related_questions': [],
+                'mode': 'auto',
+                'model': None
+            }
+        
+        # First, get the answer text using the improved extraction method
+        logger.debug("get_structured_response: Calling get_response_text...")
+        answer_text = self.get_response_text(
+            extract_images=extract_images, 
+            image_dir=image_dir,
+            query=query,
+            previous_answers=previous_answers
+        )
+        
+        logger.debug(f"get_structured_response: Got answer_text length: {len(answer_text) if answer_text else 0}")
+        
+        try:
+            structured_data = self.page.evaluate("""
+                () => {
+                    const main = document.querySelector('main');
+                    if (!main) return null;
+                    
+                    // Extract sources
+                    const sources = [];
+                    const seenUrls = new Set();
+                    const allLinks = main.querySelectorAll('a[href]');
+                    
+                    console.log(`[TELEMETRY] Found ${allLinks.length} total links in page`);
+                    
+                    allLinks.forEach(link => {
+                        let href = link.getAttribute('href');
+                        if (!href) return;
+                        
+                        let url = href;
+                        // Normalize URL format
+                        if (url.startsWith('//')) {
+                            url = 'https:' + url;
+                        } else if (url.startsWith('/') && !url.startsWith('//')) {
+                            // Relative URL - could be internal perplexity link, skip those
+                            // But keep if it's a redirect or external link indicator
+                            if (url.startsWith('/search') || url.startsWith('/thread')) {
+                                return; // Skip internal perplexity navigation
+                            }
+                            // Check if it's actually an external URL embedded in path
+                            if (url.includes('http')) {
+                                // Extract embedded URL
+                                const urlMatch = url.match(/https?:\\/\\/[^\\s\\)]+/);
+                                if (urlMatch) {
+                                    url = urlMatch[0];
+                                } else {
+                                    return; // Not a valid external URL
+                                }
+                            } else {
+                                return; // Skip other relative paths
+                            }
+                        }
+                        
+                        // Only include external URLs (not perplexity.ai itself)
+                        if (url.startsWith('http') && !url.includes('perplexity.ai') && !seenUrls.has(url)) {
+                            seenUrls.add(url);
+                            let title = (link.innerText || link.textContent || link.getAttribute('title') || '').trim();
                             
-                            // Final fallback: use domain name with better formatting
-                            if (!text || text.length < 2) {
+                            // If no title or very short title, use domain as title
+                            if (!title || title.length < 2) {
                                 try {
                                     const urlObj = new URL(url);
-                                    let hostname = urlObj.hostname.replace('www.', '');
-                                    // Capitalize first letter
-                                    text = hostname.charAt(0).toUpperCase() + hostname.slice(1);
+                                    title = urlObj.hostname.replace('www.', '');
                                 } catch(e) {
-                                    text = url;
+                                    title = url;
                                 }
                             }
                             
-                            // Skip only very obvious navigation links (single-word exact matches)
-                            const isNavLink = uiKeywords.some(kw => 
-                                text.toLowerCase() === kw.toLowerCase() && text.length < 20);
-                            
-                            // Skip if text is just the URL (but allow domain names)
-                            const isJustUrl = (text === url || text === href) && text.length > 50;
-                            
-                            // Include link if it has any reasonable text
-                            if (!isNavLink && !isJustUrl && text.length >= 1) {
-                                // Clean up text
-                                text = text.replace(/\\s+/g, ' ').trim();
-                                // If text is still too short, use domain name
-                                if (text.length < 2) {
-                                    try {
-                                        const urlObj = new URL(url);
-                                        text = urlObj.hostname.replace('www.', '');
-                                    } catch(e) {
-                                        text = url;
-                                    }
-                                }
-                                links.push({ text: text, url: url });
+                            // Be more lenient with title length - accept any reasonable length
+                            // Only filter out obviously invalid ones (empty or extremely long)
+                            if (title && title.length >= 1 && title.length < 500) {
+                                sources.push({
+                                    title: title.replace(/\\s+/g, ' ').trim(),
+                                    url: url,
+                                    snippet: '',
+                                    citation: title
+                                });
                             }
                         }
                     });
                     
-                    // Also try to find source links near "X sources" text
-                    // When we see "10 sources", look for nearby containers with source links
-                    const sourceCountPattern = /(\\d+)\\s+sources?/i;
-                    const walker = document.createTreeWalker(main, NodeFilter.SHOW_TEXT, null, false);
-                    let node;
-                    while (node = walker.nextNode()) {
-                        if (node.textContent && sourceCountPattern.test(node.textContent)) {
-                            // Found "X sources" text, look for links in parent containers
-                            let parent = node.parentElement;
-                            let depth = 0;
-                            while (parent && depth < 7) {
-                                // Look for ALL links in this parent (not just http-starting)
-                                const nearbyLinks = parent.querySelectorAll('a[href]');
-                                nearbyLinks.forEach(link => {
-                                    let href = link.getAttribute('href');
-                                    if (!href) return;
-                                    
-                                    // Normalize href
-                                    if (href.startsWith('//')) {
-                                        href = 'https:' + href;
-                                    } else if (href.startsWith('/') && !href.startsWith('//')) {
-                                        return; // Skip relative links
-                                    }
-                                    
-                                    if (href.startsWith('http') && !href.includes('perplexity.ai') && !seenUrls.has(href)) {
-                                        let text = (link.innerText || link.textContent || link.getAttribute('title') || '').trim();
-                                        
-                                        // Try parent text if link has no text
-                                        if (!text || text.length < 2) {
-                                            const linkParent = link.parentElement;
-                                            if (linkParent) {
-                                                const parentText = (linkParent.innerText || linkParent.textContent || '').trim();
-                                                // Use parent text if reasonable length
-                                                if (parentText.length > 2 && parentText.length < 300) {
-                                                    text = parentText.replace(href, '').trim();
-                                                }
-                                            }
-                                        }
-                                        
-                                        // Fallback to domain
-                                        if (!text || text.length < 2) {
-                                            try {
-                                                const urlObj = new URL(href);
-                                                text = urlObj.hostname.replace('www.', '');
-                                            } catch(e) {
-                                                text = href;
-                                            }
-                                        }
-                                        
-                                        if (text.length >= 1) {
-                                            seenUrls.add(href);
-                                            links.push({ text: text.replace(/\\s+/g, ' ').trim(), url: href });
+                    console.log(`[TELEMETRY] Extracted ${sources.length} external source URLs (deduplicated)`);
+                    
+                    // Extract related questions
+                    const relatedQuestions = [];
+                    const relatedSection = Array.from(main.querySelectorAll('*')).find(el => {
+                        const text = (el.innerText || el.textContent || '').trim();
+                        return text === 'Related' || text.startsWith('Related');
+                    });
+                    
+                    if (relatedSection) {
+                        const container = relatedSection.closest('div, section, article') || relatedSection.parentElement;
+                                if (container) {
+                            const buttons = container.querySelectorAll('button');
+                            buttons.forEach(btn => {
+                                const text = (btn.innerText || btn.textContent || '').trim();
+                                if (text && text.length > 15 && text.length < 200) {
+                                    if (text.endsWith('?') || text.includes('How') || text.includes('What') || text.includes('Explain')) {
+                                        if (!relatedQuestions.includes(text)) {
+                                            relatedQuestions.push(text);
                                         }
                                     }
-                                });
-                                parent = parent.parentElement;
-                                depth++;
-                            }
+                                }
+                            });
                         }
                     }
                     
-                    // Add sources section if we found links
-                    if (links.length > 0) {
-                        // Links are already deduplicated by seenUrls during extraction
-                        // Sort by text length (more descriptive first) or alphabetically
-                        links.sort((a, b) => {
-                            // Prefer links with better text (longer, more descriptive)
-                            if (a.text.length !== b.text.length) {
-                                return b.text.length - a.text.length;
-                            }
-                            return a.text.localeCompare(b.text);
-                        });
-                        
-                        // Add sources section at the end
-                        result += '\\n\\n---\\nSources:\\n';
-                        links.forEach((link, idx) => {
-                            // Clean up link text (remove extra whitespace, newlines)
-                            const cleanText = link.text.replace(/\\s+/g, ' ').trim();
-                            result += `${idx + 1}. [${cleanText}](${link.url})\\n`;
-                        });
-                    }
-                    
-                    return result;
+                    return {
+                        sources: sources,
+                        related_questions: relatedQuestions,
+                        mode: 'auto',
+                        model: null
+                    };
                 }
             """)
             
-            if response_data:
-                return response_data.strip()
-        
+            if structured_data:
+                logger.debug(f"get_structured_response: Got structured data with {len(structured_data.get('sources', []))} sources")
+                result = {
+                    'query': query,
+                    'answer': answer_text,  # Use the improved answer extraction
+                    'sources': structured_data.get('sources', []),
+                    'related_questions': structured_data.get('related_questions', []),
+                    'mode': structured_data.get('mode', 'auto'),
+                    'model': structured_data.get('model'),
+                    'timestamp': datetime.now().isoformat()
+                }
+                logger.info(f"get_structured_response: Returning result with answer length: {len(result.get('answer', ''))}")
+                return result
+            else:
+                logger.warning("get_structured_response: structured_data is None or empty")
         except Exception as e:
-            # Fallback to traditional method
+            logger.error(f"Error extracting structured data: {str(e)}")
+            import traceback
+            logger.debug(f"Full traceback: {traceback.format_exc()}")
             pass
         
-        # Traditional fallback method
-        selectors = [
-            '.prose',
-            '[class*="answer"]',
-            '[class*="response"]',
-            '[class*="result"]',
-            'main article',
-            '[role="article"]',
-        ]
-        
-        best_text = ""
-        best_length = 0
-        
-        for selector in selectors:
-            try:
-                elements = self.page.query_selector_all(selector)
-                for element in elements:
-                    try:
-                        if element.is_visible():
-                            text = element.inner_text()
-                            if text and len(text) > best_length:
-                                text_lower = text.lower()
-                                skip_keywords = ['menu', 'navigation', 'footer', 'header', 'cookie', 'sign in', 'log in', 'sign up']
-                                if not any(skip in text_lower for skip in skip_keywords):
-                                    best_text = text
-                                    best_length = len(text)
-                    except:
-                        continue
-            except:
-                continue
-        
-        if best_text:
-            return best_text.strip()
-        
-        return ""
+        # Fallback - return with answer text we already extracted
+        logger.info(f"get_structured_response: Using fallback with answer length: {len(answer_text)}")
+        return {
+            'query': query,
+            'answer': answer_text,
+            'sources': [],
+            'related_questions': [],
+            'mode': 'auto',
+            'model': None,
+            'timestamp': datetime.now().isoformat()
+        }
     
-    def interactive_mode(self) -> None:
-        """Keep browser open for interactive use"""
+    
+    def get_page_content(self) -> str:
+        """Get full page content"""
+        if not self.page:
+            return ""
+        try:
+            return self.page.content()
+        except Exception:
+            return ""
+    
+    def save_screenshot(self, filepath: str) -> None:
+        """Save screenshot of current page"""
         if not self.page:
             return
+        try:
+            self.page.screenshot(path=filepath, full_page=True)
+        except Exception:
+            pass
+    
+    def extract_cookies(self, domain: str = "perplexity.ai") -> Dict[str, str]:
+        """
+        Extract cookies from current browser context using CDP
         
-        print("\nBrowser is open. Use it interactively.")
-        print("Press Ctrl+C to close...")
+        Args:
+            domain: Domain to extract cookies for
+            
+        Returns:
+            Dictionary of cookie name -> value
+        """
+        if not self.context:
+            raise Exception("Browser context not available")
         
         try:
-            # Keep running until interrupted
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\nClosing browser...")
+            # Try CDP method first (more reliable)
+            if self.page:
+                try:
+                    cdp_session = self.context.new_cdp_session(self.page)
+                    cookies_response = cdp_session.send('Network.getCookies', {
+                        'urls': [f'https://www.{domain}', f'https://{domain}']
+                    })
+                    
+                    cookie_dict = {}
+                    if 'cookies' in cookies_response:
+                        for cookie in cookies_response['cookies']:
+                            cookie_dict[cookie['name']] = cookie['value']
+                    
+                    if cookie_dict:
+                        return cookie_dict
+                except Exception as e:
+                    print(f"CDP extraction failed: {e}, using fallback")
+            
+            # Fallback: Use Playwright's cookie API
+            cookies = self.context.cookies(f'https://www.{domain}')
+            cookie_dict = {}
+            for cookie in cookies:
+                cookie_dict[cookie['name']] = cookie['value']
+            
+            return cookie_dict
+        except Exception as e:
+            raise Exception(f"Failed to extract cookies: {str(e)}")
+    
+    def save_cookies_to_profile(self, profile_name: str, domain: str = "perplexity.ai") -> bool:
+        """
+        Extract cookies from current browser session and save to profile
+        
+        Args:
+            profile_name: Profile name to save cookies as
+            domain: Domain to extract cookies for
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            from ..auth.cookie_manager import CookieManager  # type: ignore
+        except ImportError:
+            try:
+                from auth.cookie_manager import CookieManager  # type: ignore
+            except ImportError:
+                raise ImportError("CookieManager not available")
+        
+        cookies = self.extract_cookies(domain=domain)
+        
+        if not cookies:
+            logger.warning("No cookies extracted")
+            return False
+        
+        cookie_manager = CookieManager()
+        cookie_manager.save_cookies(cookies, name=profile_name)
+        logger.info(f"Saved {len(cookies)} cookies to profile: {profile_name}")
+        return True
     
     def close(self) -> None:
-        """Close browser and cleanup"""
+        """Close browser and cleanup - suppress all errors"""
+        # Suppress warnings and stderr output during cleanup
+        import warnings
+        import sys
+        import os
+        
+        warnings.filterwarnings('ignore')
+        
+        # Redirect stderr to devnull to suppress Playwright/Camoufox cleanup errors
+        old_stderr = sys.stderr
+        try:
+            sys.stderr = open(os.devnull, 'w')
+        except Exception:
+            pass
+        
+        try:
+            if self.tab_manager:
+                self.tab_manager.close_all()
+                self.tab_manager = None
+        except Exception:
+            pass
+        
         try:
             if self.page:
-                self.page.close()
+                try:
+                    if not self.page.is_closed():
+                        self.page.close()
+                except Exception:
+                    pass
                 self.page = None
-        except:
+        except Exception:
             pass
         
         try:
             if self.context:
-                # For persistent context, browser IS the context
-                if self.user_data_dir:
-                    # Persistent context - close all pages but keep context
-                    for page in self.context.pages:
-                        try:
-                            page.close()
-                        except:
-                            pass
-                    # Close the persistent context
-                    self.context.close()
-                else:
-                    # Regular context - close it
-                    self.context.close()
+                self.context.close()
                 self.context = None
-        except:
+        except Exception:
             pass
         
         try:
-            if self.browser and not self.user_data_dir:
-                # Only close browser if it's not a persistent context
-                # (persistent context is already closed above)
+            if self.browser:
                 self.browser.close()
                 self.browser = None
-        except:
+        except Exception:
             pass
         
         try:
-            if self.playwright:
-                self.playwright.stop()
+            # If using Camoufox, exit the context manager properly
+            if self._camoufox:
+                try:
+                    self._camoufox.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._camoufox = None
+            elif self.playwright:
+                try:
+                    self.playwright.stop()
+                except Exception:
+                    pass
                 self.playwright = None
-        except:
+        except Exception:
             pass
         
-        print("✓ Browser closed")
+        # Small delay to ensure cleanup completes
+        try:
+            import time
+            time.sleep(0.1)
+        except Exception:
+            pass
+        finally:
+            # Restore stderr
+            try:
+                if sys.stderr != old_stderr:
+                    sys.stderr.close()
+                sys.stderr = old_stderr
+            except Exception:
+                pass

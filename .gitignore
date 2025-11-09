@@ -7,6 +7,7 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+/browser_data/
 downloads/
 eggs/
 .eggs/
@@ -22,12 +23,17 @@ wheels/
 
 # Virtual Environment
 venv/
+venv-windows/
+venv-wsl2/
 env/
 ENV/
 
 # IDE
 .vscode/
 .idea/
+.claude/
+.cursor/
+.factory/
 *.swp
 *.swo
 
@@ -36,6 +42,7 @@ ENV/
 cookies.json
 *.log
 logs/
+api_discovery/*.log
 exports/
 screenshots/
 .cache/

@@ -95,15 +95,88 @@ class CookieManager:
         """
         try:
             import browser_cookie3
-            
-            # Get Chrome cookies for perplexity.ai
-            cookies = browser_cookie3.chrome(domain_name='perplexity.ai')
+            import platform
             
             cookie_dict = {}
-            for cookie in cookies:
-                cookie_dict[cookie.name] = cookie.value
+            
+            # Try different methods to get Chrome cookies
+            try:
+                # Method 1: Default Chrome profile
+                cookies = browser_cookie3.chrome(domain_name='perplexity.ai')
+                for cookie in cookies:
+                    cookie_dict[cookie.name] = cookie.value
+                
+                if cookie_dict:
+                    return cookie_dict
+            except Exception as e1:
+                print(f"Warning: Default method failed: {e1}")
+            
+            # Method 2: Try with custom profile path (Windows and Linux/WSL2)
+            if not profile_path:
+                import os
+                username = os.getenv('USERNAME') or os.getenv('USER')
+                if username:
+                    default_paths = []
+                    if platform.system() == 'Windows':
+                        # Windows Chrome paths
+                        default_paths = [
+                            f"C:\\Users\\{username}\\AppData\\Local\\Google\\Chrome\\User Data\\Default",
+                            f"C:\\Users\\{username}\\AppData\\Local\\Google\\Chrome\\User Data\\Profile 1",
+                        ]
+                    elif platform.system() == 'Linux':
+                        # Linux/WSL2 Chrome paths
+                        # Try WSL2 Windows Chrome path first (if accessible)
+                        wsl_windows_path = f"/mnt/c/Users/{username}/AppData/Local/Google/Chrome/User Data/Default"
+                        if os.path.exists(wsl_windows_path):
+                            default_paths.append(wsl_windows_path)
+                        # Linux native Chrome paths
+                        default_paths.extend([
+                            os.path.expanduser("~/.config/google-chrome/Default"),
+                            os.path.expanduser("~/.config/google-chrome/Profile 1"),
+                            os.path.expanduser("~/.config/chromium/Default"),
+                            os.path.expanduser("~/.config/chromium/Profile 1"),
+                        ])
+                    
+                    for path in default_paths:
+                        if os.path.exists(path):
+                            try:
+                                cookies = browser_cookie3.chrome(
+                                    domain_name='perplexity.ai',
+                                    cookie_file=os.path.join(path, 'Cookies')
+                                )
+                                for cookie in cookies:
+                                    cookie_dict[cookie.name] = cookie.value
+                                if cookie_dict:
+                                    return cookie_dict
+                            except Exception:
+                                continue
+            
+            # Method 3: Try with provided profile path
+            if profile_path:
+                try:
+                    cookie_file = os.path.join(profile_path, 'Cookies')
+                    if os.path.exists(cookie_file):
+                        cookies = browser_cookie3.chrome(
+                            domain_name='perplexity.ai',
+                            cookie_file=cookie_file
+                        )
+                        for cookie in cookies:
+                            cookie_dict[cookie.name] = cookie.value
+                        if cookie_dict:
+                            return cookie_dict
+                except Exception:
+                    pass
+            
+            if not cookie_dict:
+                raise Exception(
+                    "Failed to find Chrome cookies. Make sure:\n"
+                    "1. Chrome is completely closed (check Task Manager)\n"
+                    "2. You have visited perplexity.ai and are logged in\n"
+                    "3. Try using --profile-path option with your Chrome profile path"
+                )
             
             return cookie_dict
+            
         except ImportError:
             raise ImportError("browser_cookie3 not installed. Run: pip install browser-cookie3")
         except Exception as e:

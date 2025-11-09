@@ -7,10 +7,15 @@ by monitoring network traffic during browser usage.
 """
 import json
 import asyncio
+import sys
 from datetime import datetime
 from typing import List, Dict, Any
 from playwright.async_api import async_playwright
 from pathlib import Path
+
+# Force unbuffered output for real-time terminal updates
+# NOTE: All print statements use flush=True for real-time output
+# Run Python with -u flag for best results: python -u script.py
 
 
 class NetworkInspector:
@@ -39,8 +44,8 @@ class NetworkInspector:
     
     async def start(self, headless: bool = False):
         """Start browser with network monitoring"""
-        print("Starting Network Inspector...")
-        print("="*70)
+        print("Starting Network Inspector...", flush=True)
+        print("="*70, flush=True)
         
         self.playwright = await async_playwright().start()
         
@@ -56,83 +61,243 @@ class NetworkInspector:
         
         self.page = await self.context.new_page()
         
-        # Set up network monitoring
+        # CRITICAL: Enable request interception to see ALL requests
+        # This bypasses any filtering and captures everything
+        await self.page.route("**/*", self._route_handler)
+        
+        # Set up network monitoring - capture ALL requests
         self.page.on("request", self._on_request)
         self.page.on("response", self._on_response)
         
-        print("✓ Browser started with network monitoring")
-        print("✓ Navigating to Perplexity...")
+        # Monitor WebSocket connections
+        self.page.on("websocket", self._on_websocket)
         
-        await self.page.goto("https://www.perplexity.ai")
-        await asyncio.sleep(2)
+        # Monitor console for any API-related logs
+        self.page.on("console", self._on_console)
         
-        print("✓ Ready to capture traffic\n")
+        # Monitor page errors
+        self.page.on("pageerror", self._on_page_error)
+        
+        print("[OK] Browser started with network monitoring", flush=True)
+        print("[OK] Monitoring: HTTP requests, WebSockets, SSE, Console logs", flush=True)
+        print("[OK] Navigating to Perplexity...", flush=True)
+        
+        await self.page.goto("https://www.perplexity.ai", wait_until="networkidle")
+        await asyncio.sleep(3)
+        
+        print("[OK] Ready to capture traffic", flush=True)
+        print("[!] IMPORTANT: Perform a search in the browser to capture search endpoints!", flush=True)
+        print("[!] Watch for [TARGET] emoji - those are search-related endpoints\n", flush=True)
+    
+    async def _route_handler(self, route):
+        """Intercept and log ALL network requests before they're processed"""
+        try:
+            request = route.request
+            url = request.url
+            
+            # Log ALL requests to Perplexity domains (including subdomains)
+            if 'perplexity' in url.lower():
+                # Extract method and URL
+                method = request.method
+                endpoint = self._extract_endpoint(url)
+                
+                # Log immediately to ensure we see it
+                print(f"[INTERCEPT] {method} {endpoint}", flush=True)
+                
+                # Check if it's a search-related request
+                is_search = any(term in endpoint.lower() or term in url.lower() 
+                              for term in ['search', 'chat', 'query', 'ask', 'stream', 'compose', 'message'])
+                if is_search:
+                    print(f"   [TARGET] SEARCH-RELATED REQUEST DETECTED!", flush=True)
+                    if request.post_data:
+                        print(f"   Post data: {request.post_data[:300]}...", flush=True)
+            
+            # Continue the request (don't block it)
+            await route.continue_()
+        except Exception as e:
+            # Don't crash on route handler errors
+            try:
+                await route.continue_()
+            except:
+                pass
+    
+    def _on_page_error(self, error):
+        """Capture page errors"""
+        print(f"❌ PAGE ERROR: {error}", flush=True)
     
     def _on_request(self, request):
-        """Capture outgoing requests"""
+        """Capture outgoing requests - capture EVERYTHING related to Perplexity"""
         url = request.url
         
-        # Only capture Perplexity API calls
-        if 'perplexity.ai' in url and ('/api/' in url or '/socket' in url):
-            request_data = {
-                'timestamp': datetime.now().isoformat(),
-                'url': url,
-                'method': request.method,
-                'headers': dict(request.headers),
-                'post_data': request.post_data if request.method == 'POST' else None,
-                'resource_type': request.resource_type
-            }
+        # Capture ALL Perplexity-related requests (including subdomains, CDNs, etc.)
+        if 'perplexity' in url.lower():
+            # Skip only obvious static assets
+            resource_type = request.resource_type
+            if resource_type in ['stylesheet', 'image', 'font', 'media']:
+                return
             
-            self.captured_requests.append(request_data)
-            
-            # Organize by endpoint
-            endpoint = self._extract_endpoint(url)
-            if endpoint not in self.api_endpoints:
-                self.api_endpoints[endpoint] = []
-            self.api_endpoints[endpoint].append(request_data)
-            
-            print(f"📤 REQUEST: {request.method} {endpoint}")
-            if request.post_data:
+            # Log ALL non-GET requests (POST, PUT, PATCH, DELETE)
+            if request.method in ['POST', 'PUT', 'PATCH', 'DELETE']:
+                self._log_request(request, url)
+            # Log all /api/ requests
+            elif '/api/' in url:
+                self._log_request(request, url)
+            # Log WebSocket, SSE, stream endpoints
+            elif any(term in url.lower() for term in ['/socket', '/sse', '/stream', '/ws', '/wss']):
+                self._log_request(request, url)
+            # Log anything with search/chat/query in URL
+            elif any(term in url.lower() for term in ['/chat', '/search', '/query', '/ask', '/compose', '/message']):
+                self._log_request(request, url)
+            # Log any xhr/fetch requests (likely API calls)
+            elif resource_type in ['xhr', 'fetch']:
+                self._log_request(request, url)
+    
+    def _log_request(self, request, url):
+        """Log a request with full details"""
+        request_data = {
+            'timestamp': datetime.now().isoformat(),
+            'url': url,
+            'method': request.method,
+            'headers': dict(request.headers),
+            'post_data': request.post_data if request.method in ['POST', 'PUT', 'PATCH'] else None,
+            'resource_type': request.resource_type
+        }
+        
+        self.captured_requests.append(request_data)
+        
+        # Organize by endpoint
+        endpoint = self._extract_endpoint(url)
+        if endpoint not in self.api_endpoints:
+            self.api_endpoints[endpoint] = []
+        self.api_endpoints[endpoint].append(request_data)
+        
+        # Highlight important endpoints
+        is_search = any(term in endpoint.lower() for term in ['search', 'chat', 'query', 'ask', 'stream'])
+        emoji = "🎯" if is_search else "📤"
+        
+        print(f"{emoji} REQUEST: {request.method} {endpoint}", flush=True)
+        if request.post_data:
+            try:
+                payload = json.loads(request.post_data)
+                print(f"   Payload: {json.dumps(payload, indent=2)[:500]}...", flush=True)
+            except:
+                print(f"   Payload: {request.post_data[:200]}...", flush=True)
+        
+        # Log headers for POST requests (might contain important info)
+        if request.method == 'POST' and is_search:
+            important_headers = {k: v for k, v in request.headers.items() 
+                                if k.lower() in ['content-type', 'x-requested-with', 'referer', 'origin']}
+            if important_headers:
+                print(f"   Headers: {json.dumps(important_headers, indent=2)}", flush=True)
+    
+    def _on_websocket(self, ws):
+        """Capture WebSocket connections"""
+        url = ws.url
+        if 'perplexity' in url.lower():
+            print(f"🔌 WEBSOCKET: {url}", flush=True)
+            # Store reference to avoid closure issues
+            def on_received(data):
                 try:
-                    payload = json.loads(request.post_data)
-                    print(f"   Payload: {json.dumps(payload, indent=2)[:200]}...")
-                except:
-                    print(f"   Payload: {request.post_data[:100]}...")
+                    self._on_ws_frame(url, "received", data)
+                except Exception as e:
+                    print(f"   Error in WS frame received: {e}", flush=True)
+            
+            def on_sent(data):
+                try:
+                    self._on_ws_frame(url, "sent", data)
+                except Exception as e:
+                    print(f"   Error in WS frame sent: {e}", flush=True)
+            
+            ws.on("framereceived", on_received)
+            ws.on("framesent", on_sent)
+    
+    def _on_ws_frame(self, url, direction, data):
+        """Capture WebSocket frames"""
+        try:
+            endpoint = self._extract_endpoint(url)
+            try:
+                # Try to parse as JSON
+                if isinstance(data, (str, bytes)):
+                    data_str = data.decode('utf-8') if isinstance(data, bytes) else data
+                    frame_data = json.loads(data_str)
+                    print(f"🔌 WS {direction.upper()}: {endpoint}", flush=True)
+                    print(f"   Data: {json.dumps(frame_data, indent=2)[:300]}...", flush=True)
+                else:
+                    print(f"🔌 WS {direction.upper()}: {endpoint}", flush=True)
+                    print(f"   Data: {str(data)[:200]}...", flush=True)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                print(f"🔌 WS {direction.upper()}: {endpoint}", flush=True)
+                data_str = str(data)[:200] if not isinstance(data, (str, bytes)) else (data.decode('utf-8', errors='ignore')[:200] if isinstance(data, bytes) else data[:200])
+                print(f"   Data: {data_str}...", flush=True)
+        except Exception as e:
+            print(f"🔌 WS {direction.upper()}: Error processing frame: {e}", flush=True)
+    
+    def _on_console(self, msg):
+        """Capture console messages (might contain API info)"""
+        text = msg.text
+        if any(term in text.lower() for term in ['api', 'endpoint', 'search', 'query', 'error']):
+            print(f"💬 CONSOLE: {text[:200]}", flush=True)
     
     async def _on_response(self, response):
         """Capture incoming responses"""
         url = response.url
         
-        # Only capture Perplexity API responses
-        if 'perplexity.ai' in url and ('/api/' in url or '/socket' in url):
+        # Capture ALL Perplexity API responses (not just /api/)
+        if 'perplexity' in url.lower():
+            # Skip static assets
+            content_type = response.headers.get('content-type', '')
+            if any(t in content_type for t in ['text/css', 'image/', 'font/', 'video/']):
+                return
+            
+            # Get the request method from the request object
+            request = response.request
+            method = request.method if request else 'GET'
+            
+            # Log API responses, streams, SSE, etc.
+            # Check URL patterns OR if it's a POST/PUT/PATCH response
+            if ('/api/' in url or '/socket' in url or '/sse' in url or '/stream' in url or 
+                '/chat' in url or '/search' in url or '/query' in url or 
+                method in ['POST', 'PUT', 'PATCH']):
+                await self._log_response(response, url)
+    
+    async def _log_response(self, response, url):
+        """Log response with error handling"""
+        try:
+            body = await response.body()
+            body_text = body.decode('utf-8', errors='ignore')
+            
+            # Try to parse as JSON
             try:
-                body = await response.body()
-                body_text = body.decode('utf-8')
-                
-                # Try to parse as JSON
-                try:
-                    body_json = json.loads(body_text)
-                except:
-                    body_json = None
-                
-                response_data = {
-                    'timestamp': datetime.now().isoformat(),
-                    'url': url,
-                    'status': response.status,
-                    'headers': dict(response.headers),
-                    'body': body_json if body_json else body_text[:1000],
-                    'content_type': response.headers.get('content-type', '')
-                }
-                
-                self.captured_responses.append(response_data)
-                
-                endpoint = self._extract_endpoint(url)
-                print(f"📥 RESPONSE: {response.status} {endpoint}")
-                if body_json:
-                    print(f"   Body: {json.dumps(body_json, indent=2)[:200]}...")
-                
-            except Exception as e:
-                print(f"   Error capturing response: {str(e)}")
+                body_json = json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                body_json = None
+            
+            response_data = {
+                'timestamp': datetime.now().isoformat(),
+                'url': url,
+                'status': response.status,
+                'headers': dict(response.headers),
+                'body': body_json if body_json else body_text[:2000],  # Increased limit
+                'content_type': response.headers.get('content-type', '')
+            }
+            
+            self.captured_responses.append(response_data)
+            
+            endpoint = self._extract_endpoint(url)
+            is_search = any(term in endpoint.lower() for term in ['search', 'chat', 'query', 'ask', 'stream', 'compose', 'message'])
+            emoji = "🎯" if is_search else "📥"
+            
+            print(f"{emoji} RESPONSE: {response.status} {endpoint}", flush=True)
+            if body_json:
+                print(f"   Body: {json.dumps(body_json, indent=2)[:500]}...", flush=True)
+            elif len(body_text) > 0:
+                # Show first part of non-JSON response
+                preview = body_text[:300].replace('\n', ' ')
+                print(f"   Body (preview): {preview}...", flush=True)
+            
+        except Exception as e:
+            # Don't crash on response errors, just log them
+            print(f"   ⚠️ Error capturing response: {str(e)}", flush=True)
     
     def _extract_endpoint(self, url: str) -> str:
         """Extract endpoint from full URL"""
@@ -316,11 +481,21 @@ class NetworkInspector:
     
     async def close(self):
         """Close browser and cleanup"""
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-        print("\n✓ Browser closed")
+        try:
+            if self.browser:
+                # Try graceful close first
+                try:
+                    await self.browser.close()
+                except Exception as e:
+                    # If graceful close fails, force close
+                    print(f"   Warning: Browser close error (ignored): {e}", flush=True)
+                    pass
+            if self.playwright:
+                await self.playwright.stop()
+            print("\n✓ Browser closed", flush=True)
+        except Exception as e:
+            print(f"\n⚠ Browser cleanup warning: {e}", flush=True)
+            # Continue anyway - data is already saved
 
 
 # ============================================================================
