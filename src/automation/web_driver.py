@@ -209,11 +209,12 @@ class PerplexityWebDriver:
             self.browser = self.playwright.firefox.launch(**launch_options)
         
         # Create context with cloudscraper's user agent to match fingerprint
+        # Use reasonable viewport size (1280x720) to avoid off-screen window issues
         context_options: Dict[str, Any] = {
-            'viewport': {'width': 1920, 'height': 1080},
+            'viewport': {'width': 1280, 'height': 720},
             'ignore_https_errors': False,  # Don't ignore HTTPS errors (more secure)
             'java_script_enabled': True,
-            'accept_downloads': False,  # Don't auto-accept downloads
+            'accept_downloads': True,  # Enable downloads for export functionality
             'locale': 'en-US',
             'timezone_id': 'America/New_York',
             'permissions': [],
@@ -316,6 +317,9 @@ class PerplexityWebDriver:
         
         # Create main page (always create, regardless of cookie injection)
         self.page = self.context.new_page()
+        
+        # Set viewport size explicitly on page (ensures consistent size, especially for Camoufox)
+        self.page.set_viewport_size({'width': 1280, 'height': 720})
         
         # Initialize tab manager
         self.tab_manager = TabManager(self.context, max_tabs=5)
@@ -662,18 +666,34 @@ class PerplexityWebDriver:
         if not search_box:
             raise Exception("Could not find search input. Make sure you're logged in.")
         
+        # Bring page to front to ensure it receives focus (fixes issue when window isn't foreground)
+        try:
+            target_page.bring_to_front()
+            target_page.wait_for_timeout(100)
+        except Exception:
+            pass  # Continue even if bring_to_front fails
+        
         # Clear any existing text and enter query
         # Use Playwright's fill() method which works well with contenteditable divs
         try:
-            search_box.click()  # Focus the element
-            target_page.wait_for_timeout(200)  # Increased wait for focus (more human-like)
+            # Focus using JavaScript (more reliable than click when window isn't focused)
+            target_page.evaluate("""
+                () => {
+                    const el = document.querySelector('#ask-input') || 
+                              document.querySelector('[contenteditable="true"]');
+                    if (el) {
+                        el.focus();
+                        el.click();  // Ensure it's focused
+                    }
+                }
+            """)
+            target_page.wait_for_timeout(200)
             
             # Use fill() method - works with contenteditable divs
-            # But add a small delay to simulate human typing
             search_box.fill(query)
             
             # Wait longer to ensure input is processed and looks more human
-            target_page.wait_for_timeout(500)  # Increased from 100ms to 500ms
+            target_page.wait_for_timeout(500)
             
         except Exception as e:
             # Fallback: try type() method if fill() fails
@@ -708,19 +728,41 @@ class PerplexityWebDriver:
         
         # Submit - try clicking submit button first, fallback to Enter
         # Add a small delay before submitting to look more human
-        target_page.wait_for_timeout(300)  # Wait before submitting
+        target_page.wait_for_timeout(300)
         
         try:
             # Look for submit button
             submit_button = target_page.query_selector('button[data-testid="submit-button"], button:has-text("Submit")')
             if submit_button and submit_button.is_visible():
-                submit_button.click()
+                # Use JavaScript click for better reliability when window isn't focused
+                submit_button.evaluate('el => el.click()')
             else:
-                # Fallback: press Enter
-                search_box.press('Enter')
+                # Fallback: press Enter using JavaScript (more reliable)
+                target_page.evaluate("""
+                    () => {
+                        const el = document.querySelector('#ask-input') || 
+                                  document.querySelector('[contenteditable="true"]');
+                        if (el) {
+                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                            el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                        }
+                    }
+                """)
         except Exception:
-            # Fallback: press Enter
-            search_box.press('Enter')
+            # Last resort: try Playwright's Enter key
+            try:
+                search_box.press('Enter')
+            except Exception:
+                # Final fallback: JavaScript Enter
+                target_page.evaluate("""
+                    () => {
+                        const el = document.querySelector('#ask-input') || 
+                                  document.querySelector('[contenteditable="true"]');
+                        if (el) {
+                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                        }
+                    }
+                """)
         
         # Wait a moment after submitting before checking for response
         target_page.wait_for_timeout(1000)  # Wait 1 second after submit
@@ -1994,6 +2036,87 @@ class PerplexityWebDriver:
         cookie_manager.save_cookies(cookies, name=profile_name)
         logger.info(f"Saved {len(cookies)} cookies to profile: {profile_name}")
         return True
+    
+    def export_as_markdown(
+        self,
+        output_dir: Optional[Union[str, Path]] = None,
+        page: Optional[Page] = None
+    ) -> Optional[Path]:
+        """
+        Export current thread as Markdown file
+        
+        Works in both headed and headless modes. Downloads are enabled via
+        accept_downloads=True in the browser context.
+        
+        Args:
+            output_dir: Directory to save the markdown file (default: 'exports' in project root)
+            page: Page instance to use (default: self.page)
+            
+        Returns:
+            Path to the downloaded markdown file, or None if export failed
+            
+        Raises:
+            Exception: If browser not started, thread actions button not found, or export fails
+        """
+        target_page = page or self.page
+        if not target_page:
+            raise Exception("Browser not started")
+        
+        try:
+            # Find visible Thread actions button
+            thread_actions_btn = None
+            for _ in range(10):  # Up to 5 seconds (10 * 500ms)
+                for btn in target_page.query_selector_all('button[aria-label="Thread actions"]'):
+                    if btn.is_visible():
+                        thread_actions_btn = btn
+                        break
+                if thread_actions_btn:
+                    break
+                target_page.wait_for_timeout(500)
+            
+            if not thread_actions_btn:
+                raise Exception("Thread actions button not visible. Make sure search results are rendered.")
+            
+            # Open menu and find Export as Markdown
+            thread_actions_btn.click()
+            target_page.wait_for_timeout(200)
+            
+            # Find Export as Markdown by text
+            for item in target_page.query_selector_all('[role="menuitem"]'):
+                if item.is_visible() and 'Export as Markdown' in item.inner_text().strip():
+                    markdown_item = item
+                    break
+            else:
+                raise Exception("Export as Markdown option not found in menu.")
+            
+            # Setup output directory
+            output_dir = Path(output_dir) if output_dir else Path.cwd() / "exports"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Trigger download
+            with target_page.expect_download(timeout=30000) as download_info:
+                markdown_item.click()
+            
+            # Save file
+            suggested_filename = download_info.value.suggested_filename
+            if not suggested_filename or not suggested_filename.endswith('.md'):
+                suggested_filename = f"perplexity_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            
+            download_path = output_dir / suggested_filename
+            download_info.value.save_as(download_path)
+            
+            logger.info(f"Successfully exported thread as Markdown: {download_path}")
+            return download_path
+            
+        except Exception as e:
+            logger.error(f"Failed to export as Markdown: {e}")
+            # Try to close menu if it's still open
+            try:
+                target_page.keyboard.press('Escape')
+                target_page.wait_for_timeout(200)
+            except Exception:
+                pass
+            raise
     
     def close(self) -> None:
         """Close browser and cleanup - suppress all errors"""

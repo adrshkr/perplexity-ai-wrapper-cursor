@@ -8,7 +8,9 @@ param(
     [string]$Profile = "fresh",
     [switch]$Headless,
     [switch]$KeepBrowserOpen,
-    [switch]$DebugMode  # Enable debug logging
+    [switch]$DebugMode,  # Enable debug logging
+    [switch]$ExportMarkdown,  # Export thread as Markdown file after search
+    [string]$ExportDir = ""  # Directory to save exported Markdown (default: exports/)
 )
 
 # Change to script directory
@@ -33,6 +35,8 @@ if ($Mode -eq "api") {
     if ($Headless) { $cmdArgs += "--headless" }
     if ($KeepBrowserOpen) { $cmdArgs += "--keep-browser-open" }
     if ($DebugMode) { $cmdArgs += "--debug" }
+    if ($ExportMarkdown) { $cmdArgs += "--export-markdown" }
+    if ($ExportDir) { $cmdArgs += "--export-dir"; $cmdArgs += "$ExportDir" }
     
     # Execute with proper argument separation
     & python -m src.interfaces.cli $cmdArgs

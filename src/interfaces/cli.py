@@ -779,7 +779,9 @@ def browser(headless, user_data_dir, profile, persistent):
 @click.option('--keep-browser-open', '--interactive', is_flag=True, help='Keep browser open after search completes')
 @click.option('--extract-images', is_flag=True, help='Extract and save images from response')
 @click.option('--image-dir', type=click.Path(), default='_resources', help='Directory to save images (default: _resources)')
-def browser_search(query, profile, headless, output, user_data_dir, persistent, debug, keep_browser_open, extract_images, image_dir):
+@click.option('--export-markdown', is_flag=True, help='Export thread as Markdown file after search completes')
+@click.option('--export-dir', type=click.Path(), help='Directory to save exported Markdown file (default: exports/)')
+def browser_search(query, profile, headless, output, user_data_dir, persistent, debug, keep_browser_open, extract_images, image_dir, export_markdown, export_dir):
     """
     Search using browser automation (bypasses Cloudflare)
     
@@ -1114,6 +1116,26 @@ def browser_search(query, profile, headless, output, user_data_dir, persistent, 
                 console.print("\n[bold green]Answer:[/bold green]")
                 console.print(result)
                 console.print(f"\n[dim]Response length: {len(result)} characters[/dim]")
+        
+        # Export as Markdown if requested
+        if export_markdown:
+            try:
+                if debug:
+                    console.print("\n[cyan]Exporting thread as Markdown...[/cyan]")
+                
+                export_path = driver.export_as_markdown(output_dir=export_dir)
+                
+                if export_path:
+                    console.print(f"\n[green]✓ Thread exported as Markdown: {export_path}[/green]")
+                else:
+                    console.print("\n[yellow]⚠ Export completed but no file path returned[/yellow]")
+            except Exception as export_error:
+                console.print(f"\n[red]✗ Failed to export as Markdown: {export_error}[/red]")
+                if debug:
+                    import traceback
+                    console.print(f"[dim]{traceback.format_exc()}[/dim]")
+                # Don't fail the entire command if export fails
+                console.print("[yellow]Continuing...[/yellow]")
         
         # Keep browser open if requested
         if keep_browser_open:
