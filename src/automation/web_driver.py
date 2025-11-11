@@ -1,17 +1,19 @@
 """
-Perplexity AI Wrapper - Browser Automation
-File: src/automation/web_driver.py
-
-Browser automation for Perplexity.ai using Playwright
+ABOUTME: Browser automation for Perplexity.ai using Playwright
+ABOUTME: Coordinates cookie injection, Cloudflare bypass, and search execution
 """
 import logging
 import sys
 import time
-import threading
-from collections import deque
+import platform
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+# Import extracted components
+from .tab_manager import TabManager
+from .cookie_injector import CookieInjector
+from .cloudflare_handler import CloudflareHandler
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -76,90 +78,9 @@ if CLOUDSCRAPER_AVAILABLE:
         CloudflareBypass = None
 
 
-class TabManager:
-    """Manages a pool of browser tabs for concurrent queries"""
-    
-    def __init__(self, context: BrowserContext, max_tabs: int = 5):
-        self.context = context
-        self.max_tabs = max_tabs
-        self.available_tabs: Deque[Page] = deque()
-        self.active_tabs: Dict[Page, Dict] = {}
-        self.lock = threading.Lock()
-    
-    def get_tab(self) -> Page:
-        """Get an available tab, creating one if needed"""
-        with self.lock:
-            # Reuse available tab if exists
-            if self.available_tabs:
-                tab = self.available_tabs.popleft()
-                try:
-                    if tab.is_closed():
-                        tab = self.context.new_page()
-                    else:
-                        # Clear tab for reuse
-                        try:
-                            tab.goto("about:blank", wait_until="domcontentloaded", timeout=2000)
-                        except Exception:
-                            pass
-                except Exception:
-                    tab = self.context.new_page()
-            else:
-                # Create new tab if under limit
-                if len(self.active_tabs) < self.max_tabs:
-                    tab = self.context.new_page()
-                else:
-                    # Reuse oldest tab
-                    oldest_tab = min(self.active_tabs.items(), key=lambda x: x[1].get('created_at', 0))[0]
-                    try:
-                        if not oldest_tab.is_closed():
-                            oldest_tab.goto("about:blank", wait_until="domcontentloaded", timeout=2000)
-                        tab = oldest_tab
-                        if tab in self.active_tabs:
-                            del self.active_tabs[tab]
-                    except Exception:
-                        tab = self.context.new_page()
-            
-            # Mark as active
-            self.active_tabs[tab] = {
-                'created_at': time.time(),
-                'state': 'active'
-            }
-            
-            return tab
-    
-    def release_tab(self, tab: Page, reuse: bool = True) -> None:
-        """Release a tab back to the pool"""
-        with self.lock:
-            if tab in self.active_tabs:
-                del self.active_tabs[tab]
-            
-            if reuse and not tab.is_closed():
-                self.available_tabs.append(tab)
-            else:
-                try:
-                    if not tab.is_closed():
-                        tab.close()
-                except Exception:
-                    pass
-    
-    def close_all(self) -> None:
-        """Close all tabs"""
-        with self.lock:
-            for tab in list(self.available_tabs):
-                try:
-                    if not tab.is_closed():
-                        tab.close()
-                except Exception:
-                    pass
-            self.available_tabs.clear()
-            
-            for tab in list(self.active_tabs.keys()):
-                try:
-                    if not tab.is_closed():
-                        tab.close()
-                except Exception:
-                    pass
-            self.active_tabs.clear()
+# TabManager is now imported from .tab_manager module
+# CookieInjector is now imported from .cookie_injector module
+# CloudflareHandler is now imported from .cloudflare_handler module
 
 
 class PerplexityWebDriver:
@@ -172,457 +93,31 @@ class PerplexityWebDriver:
         stealth_mode: bool = True
     ):
         if not PLAYWRIGHT_AVAILABLE:
-            raise ImportError("Playwright is not installed. Install it with: pip install playwright && playwright install chromium")
+            raise ImportError("Playwright is not installed. Install it with: pip install playwright && playwright install firefox")
         
         self.headless = headless
         self.user_data_dir = user_data_dir
         self.stealth_mode = stealth_mode
         
+        # Browser components
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.tab_manager: Optional[TabManager] = None
-        
-        self._login_cookies: Optional[Dict[str, str]] = None
-        self._cloudscraper_cookies: Optional[Dict[str, str]] = None
-        self._cloudscraper_user_agent: Optional[str] = None
-        self._cookies_injected: bool = False  # Track if cookies already injected
         self._camoufox: Optional[Any] = None
+        
+        # Extracted components for cleaner architecture
+        self.cookie_injector = CookieInjector()
+        self.cloudflare_handler = CloudflareHandler()
     
     def set_cookies(self, cookies: Dict[str, str]) -> None:
         """Store cookies to be injected before navigation"""
-        self._login_cookies = cookies
+        self.cookie_injector.set_login_cookies(cookies)
     
-    def _should_inject_cookies(self) -> bool:
-        """Determine if cookies should be injected"""
-        # Don't inject cookies if using persistent context (user_data_dir)
-        # Persistent context already has cookies from previous sessions
-        if self.user_data_dir:
-            return False
-        
-        # Only inject if we have cookies to inject
-        return bool(self._login_cookies or self._cloudscraper_cookies)
-    
-    def _inject_cookies_into_context(self) -> None:
-        """Inject all cookies into context BEFORE navigation - only if needed"""
-        if not self.context:
-            return
-        
-        # Don't inject if using persistent context
-        if not self._should_inject_cookies():
-            return
-        
-        # OPTIMIZATION: Skip if cookies already injected
-        if self._cookies_injected:
-            logger.debug("Cookies already injected, skipping redundant injection")
-            return
-        
-        all_cookies = {}
-        # CRITICAL: Cloudflare cookies from cloudscraper MUST come first (they override old ones)
-        if self._cloudscraper_cookies:
-            all_cookies.update(self._cloudscraper_cookies)
-        # Then add login cookies (but don't override Cloudflare cookies)
-        if self._login_cookies:
-            for k, v in self._login_cookies.items():
-                # Don't override Cloudflare cookies that we just got from cloudscraper
-                if 'cf' not in k.lower() and not k.startswith('__cf'):
-                    all_cookies[k] = v
-        
-        if not all_cookies:
-            return
-        
-        playwright_cookies: List[Dict[str, Any]] = []
-        for name, value in all_cookies.items():
-            if not name or not isinstance(value, str) or len(str(value)) > 4000:
-                continue
-            try:
-                # Use URL-based cookie injection (more reliable than domain/path)
-                # Playwright prefers URL for cookie injection
-                cookie_data: Dict[str, Any] = {
-                    'name': str(name),
-                    'value': str(value),
-                    'url': 'https://www.perplexity.ai',  # Use URL instead of domain/path
-                    'secure': True,
-                    'sameSite': 'Lax',
-                }
-                
-                # Handle __Host- prefix (requires path=/ and no domain)
-                # But we can still use URL which is more compatible
-                if name.startswith('__Host-'):
-                    # For __Host- cookies, we still use URL but ensure path is /
-                    cookie_data['path'] = '/'
-                    # Don't set domain for __Host- cookies
-                    if 'domain' in cookie_data:
-                        del cookie_data['domain']
-                
-                playwright_cookies.append(cookie_data)
-            except Exception as e:
-                logger.debug(f"Failed to format cookie {name}: {e}")
-                continue
-        
-        if playwright_cookies:
-            logger.debug(f"Injecting {len(playwright_cookies)} cookies into browser context")
-            cf_clearance_injected = any(c.get('name') == 'cf_clearance' for c in playwright_cookies)
-            cf_bm_injected = any(c.get('name') == '__cf_bm' for c in playwright_cookies)
-            
-            if self._cloudscraper_cookies:
-                if not cf_clearance_injected:
-                    logger.warning("cf_clearance cookie not in cookies to inject")
-                if not cf_bm_injected:
-                    logger.warning("__cf_bm cookie not in cookies to inject")
-            
-            cf_cookies_to_inject: List[str] = []
-            for c in playwright_cookies:
-                cookie_name: Any = c.get('name')
-                if isinstance(cookie_name, str):
-                    name_lower = cookie_name.lower()
-                    if 'cf' in name_lower or cookie_name.startswith('__cf'):
-                        cf_cookies_to_inject.append(cookie_name)
-            if cf_cookies_to_inject:
-                logger.debug(f"Cloudflare cookies to inject: {cf_cookies_to_inject}")
-            
-            try:
-                self.context.add_cookies(playwright_cookies)  # type: ignore
-                logger.debug(f"Successfully injected {len(playwright_cookies)} cookies")
-                
-                # Verify cookies are in context
-                context_cookies = self.context.cookies()
-                context_cf_cookies = [
-                    c.get('name') for c in context_cookies 
-                    if 'cf' in c.get('name', '').lower() or c.get('name', '').startswith('__cf')
-                ]
-                if context_cf_cookies:
-                    logger.debug(f"Verified Cloudflare cookies in context: {context_cf_cookies}")
-                else:
-                    logger.warning("No Cloudflare cookies found in context after injection")
-                
-                # Mark cookies as injected
-                self._cookies_injected = True
-            except Exception as e:
-                # Silently try individual cookie injection without debug spam
-                injected_count = 0
-                failed_cookies = []
-                for cookie in playwright_cookies:
-                    try:
-                        self.context.add_cookies([cookie])  # type: ignore
-                        injected_count += 1
-                    except Exception as cookie_error:
-                        cookie_name = cookie.get('name', 'unknown')
-                        failed_cookies.append(cookie_name)
-                        # Only log critical cookies (cf_clearance) as warnings
-                        # Skip logging for known failing cookies like __Host-GAPS
-                        if cookie_name == 'cf_clearance':
-                            logger.warning(f"Failed to inject cf_clearance: {cookie_error}")
-                        # Suppress debug messages for other cookies to reduce noise
-                
-                # Only log summary if there are unexpected failures (not __Host-GAPS)
-                critical_failures = [c for c in failed_cookies if c not in ['__Host-GAPS']]
-                if critical_failures:
-                    logger.debug(f"Failed to inject {len(critical_failures)} cookies: {critical_failures[:5]}")
-                
-                # Only log success message at debug level if explicitly needed
-                if injected_count > 0:
-                    logger.debug(f"Injected {injected_count}/{len(playwright_cookies)} cookies successfully")
-                    # Mark cookies as injected
-                    self._cookies_injected = True
-                
-                # Verify after individual injection
-                context_cookies = self.context.cookies()
-                context_cf_cookies = [
-                    c.get('name') for c in context_cookies 
-                    if 'cf' in c.get('name', '').lower() or c.get('name', '').startswith('__cf')
-                ]
-                if context_cf_cookies:
-                    logger.debug(f"Verified Cloudflare cookies in context: {context_cf_cookies}")
-    
-    def _pre_authenticate_with_cloudscraper(self) -> None:
-        """
-        Solve Cloudflare challenge before browser opens - REQUIRED to bypass Cloudflare
-        Always gets fresh Cloudflare cookies (cf_clearance, __cf_bm) which are required
-        """
-        if not CLOUDSCRAPER_AVAILABLE:
-            raise ImportError(
-                "Cloudscraper is required for Cloudflare bypass. "
-                "Install it with: pip install cloudscraper requests"
-            )
-        
-        # Always use cloudscraper to get fresh Cloudflare cookies
-        # This is REQUIRED - Cloudflare blocks requests without valid cookies
-        logger.info("Solving Cloudflare challenge with cloudscraper")
-        try:
-            # Try CloudflareBypass wrapper first, but fall back to direct cloudscraper if it fails
-            use_wrapper = False
-            if CloudflareBypass is not None:
-                try:
-                    bypass = CloudflareBypass(
-                        browser='firefox',  # Changed to Firefox to match Camoufox
-                        use_stealth=True,
-                        interpreter='js2py',
-                        debug=False,
-                        auto_refresh_on_403=True,  # Automatically refresh session on 403 errors
-                        max_403_retries=5,  # Maximum retry attempts on 403 errors
-                        session_refresh_interval=3600  # Refresh session every hour
-                    )
-                    
-                    # Extract user agent from cloudscraper session for use in Playwright
-                    # This ensures fingerprint matching between cloudscraper and Playwright
-                    self._cloudscraper_user_agent = bypass.scraper.headers.get('User-Agent')
-                    if self._cloudscraper_user_agent:
-                        logger.debug(f"Extracted user agent from cloudscraper: {self._cloudscraper_user_agent[:50]}...")
-                    
-                    # If we have login cookies, pass them to cloudscraper to maintain session
-                    if self._login_cookies:
-                        bypass.update_cookies(self._login_cookies)
-                        logger.debug(f"Using {len(self._login_cookies)} login cookies with cloudscraper")
-                    
-                    # Solve Cloudflare challenge - this is REQUIRED
-                    if bypass.solve_challenge('https://www.perplexity.ai'):
-                        cloudscraper_cookies = bypass.get_cookies_dict()
-                        use_wrapper = True
-                    else:
-                        raise Exception("Cloudflare challenge solve returned False - may be blocked")
-                except Exception as wrapper_error:
-                    # CloudflareBypass wrapper failed, fall back to direct cloudscraper
-                    logger.warning(f"CloudflareBypass wrapper failed: {wrapper_error}, falling back to direct cloudscraper")
-                    use_wrapper = False
-            
-            if not use_wrapper:
-                # Use cloudscraper directly if wrapper not available
-                import cloudscraper
-                import time
-                
-                # Create scraper with proper browser emulation and stealth features
-                # This ensures cloudscraper matches the browser fingerprint we'll use in Playwright
-                logger.debug("Creating cloudscraper with browser emulation and stealth mode")
-                if not hasattr(cloudscraper, 'create_scraper'):
-                    raise ImportError("cloudscraper.create_scraper not available")
-                scraper = cloudscraper.create_scraper(  # type: ignore
-                    browser={
-                        'browser': 'firefox',  # Changed to Firefox to match Camoufox
-                        'platform': 'windows',
-                        'desktop': True
-                    },
-                    interpreter='js2py',  # Required for JavaScript challenge solving
-                    delay=5,  # Reduced delay for faster execution (was 10)
-                    debug=False,
-                    doubleDown=True,  # Enable double-down mode for better bypass
-                    enable_stealth=True,  # Enable stealth mode to avoid detection
-                    stealth_options={
-                        'min_delay': 1.0,
-                        'max_delay': 3.0,
-                        'human_like_delays': True,
-                        'randomize_headers': True,
-                        'browser_quirks': True
-                    },
-                    auto_refresh_on_403=True,  # Automatically refresh session on 403 errors
-                    max_403_retries=5,  # Maximum retry attempts on 403 errors
-                    session_refresh_interval=3600  # Refresh session every hour
-                )
-                
-                # Extract user agent from cloudscraper session for use in Playwright
-                # This ensures fingerprint matching between cloudscraper and Playwright
-                self._cloudscraper_user_agent = scraper.headers.get('User-Agent')
-                if self._cloudscraper_user_agent:
-                    logger.debug(f"Extracted user agent from cloudscraper: {self._cloudscraper_user_agent[:50]}...")
-                
-                logger.info("Getting fresh Cloudflare cookies with cloudscraper")
-                # Make request to trigger Cloudflare challenge if needed
-                # Cloudscraper will automatically solve it, but we need to wait for it to complete
-                max_attempts = 10  # Increased attempts for reliability
-                response = None
-                response_text_lower = ""
-                
-                for attempt in range(1, max_attempts + 1):
-                    logger.debug(f"Cloudflare bypass attempt {attempt}/{max_attempts}")
-                    try:
-                        # Use longer timeout and allow redirects
-                        response = scraper.get(
-                            'https://www.perplexity.ai', 
-                            timeout=90,  # Increased timeout for challenge solving
-                            allow_redirects=True
-                        )
-                        
-                        if response.status_code != 200:
-                            logger.debug(f"Status {response.status_code}, waiting and retrying (attempt {attempt}/{max_attempts})")
-                            # If we get multiple 403s in a row, Cloudflare is likely blocking us
-                            if response.status_code == 403 and attempt >= 5:
-                                logger.warning(f"Cloudflare is consistently returning 403 after {attempt} attempts")
-                                logger.warning("This may indicate IP blocking or advanced Cloudflare protection")
-                                if attempt >= max_attempts:
-                                    raise Exception(
-                                        f"Cloudflare blocking detected - received 403 status after {max_attempts} attempts. "
-                                        "Cloudflare may be blocking cloudscraper. Consider using browser automation instead."
-                                    )
-                            # Use exponential backoff instead of fixed sleep
-                            wait_time = min(1 + (attempt * 0.5), 3)  # 1.5s, 2s, 2.5s, max 3s
-                            time.sleep(wait_time)
-                            continue
-                        
-                        # Check if we got past Cloudflare
-                        response_text_lower = response.text.lower()
-                        has_challenge = ('just a moment' in response_text_lower or 
-                                       'checking your browser' in response_text_lower or
-                                       'please wait' in response_text_lower or
-                                       'cf-browser-verification' in response_text_lower)
-                        
-                        if has_challenge:
-                            wait_time = min(3 + attempt, 10)  # Reduced: 4s, 5s, 6s, etc., max 10s (was 12-30s)
-                            logger.debug(f"Still on Cloudflare challenge page (attempt {attempt}), waiting {wait_time}s")
-                            time.sleep(wait_time)  # Wait for JavaScript challenge to complete
-                            continue
-                        
-                        # Verify we got actual Perplexity content (not challenge page)
-                        has_perplexity_content = ('perplexity' in response_text_lower and 
-                                                 ('ask anything' in response_text_lower or 
-                                                  'search' in response_text_lower or
-                                                  'home' in response_text_lower))
-                        
-                        if has_perplexity_content:
-                            logger.info("Successfully bypassed Cloudflare - got Perplexity content")
-                            break
-                        else:
-                            logger.debug(f"Response doesn't look like Perplexity content (attempt {attempt})")
-                            wait_time = min(1 + attempt, 3)  # Exponential backoff
-                            time.sleep(wait_time)
-                            continue
-                            
-                    except Exception as e:
-                        logger.debug(f"Request failed (attempt {attempt}): {e}")
-                        if attempt < max_attempts:
-                            wait_time = min(1 + (attempt * 0.5), 3)  # Exponential backoff
-                            time.sleep(wait_time)
-                            continue
-                        else:
-                            raise
-                
-                # Final check - if we still have challenge, fail
-                if not response or response.status_code != 200:
-                    raise Exception(f"Failed to get Cloudflare cookies - status code: {response.status_code if response else 'None'}")
-                
-                response_text_lower = response.text.lower()
-                if 'just a moment' in response_text_lower or 'checking your browser' in response_text_lower:
-                    raise Exception("Still on Cloudflare challenge page after all attempts")
-                
-                # Wait briefly for cookies to be fully set after challenge completion
-                logger.debug("Waiting for Cloudflare cookies to be fully set")
-                time.sleep(0.3)  # Minimal wait - cookies are usually instant
-                
-                # Now we have fresh Cloudflare cookies
-                # Make one more request to ensure cookies are fully set
-                logger.debug("Making final request to ensure cookies are set")
-                try:
-                    scraper.get('https://www.perplexity.ai', timeout=10)  # Reduced timeout
-                    time.sleep(0.2)  # Minimal wait
-                except Exception as e:
-                    logger.debug(f"Final request failed (may be OK): {e}")
-                
-                # Use get_dict() method if available, otherwise use dict()
-                if hasattr(scraper.cookies, 'get_dict'):
-                    cloudscraper_cookies = scraper.cookies.get_dict()
-                else:
-                    cloudscraper_cookies = dict(scraper.cookies)
-                
-                # Also check response headers for Set-Cookie
-                # Response headers can be a string, list, or CaseInsensitiveDict
-                set_cookie_headers = []
-                if hasattr(response.headers, 'getall'):
-                    # requests library - getall() returns list
-                    set_cookie_headers = response.headers.getall('Set-Cookie', [])
-                elif isinstance(response.headers.get('Set-Cookie', ''), list):
-                    set_cookie_headers = response.headers.get('Set-Cookie', [])
-                else:
-                    # Single string value
-                    set_cookie_val = response.headers.get('Set-Cookie', '')
-                    if set_cookie_val:
-                        set_cookie_headers = [set_cookie_val]
-                
-                # Parse Set-Cookie headers to extract cookies
-                for cookie_header in set_cookie_headers:
-                    if 'cf_clearance=' in cookie_header:
-                        try:
-                            # Extract cf_clearance value from Set-Cookie header
-                            parts = cookie_header.split(';')[0].split('=')
-                            if len(parts) == 2 and parts[0].strip() == 'cf_clearance':
-                                cf_val = parts[1].strip()
-                                if cf_val and cf_val not in cloudscraper_cookies:
-                                    cloudscraper_cookies['cf_clearance'] = cf_val
-                                    logger.debug("Extracted cf_clearance from Set-Cookie header")
-                        except Exception:
-                            pass
-                
-                # Debug: Show all cookies cloudscraper got
-                logger.debug(f"Cloudscraper obtained {len(cloudscraper_cookies)} cookies")
-                cf_cookies_found = [k for k in cloudscraper_cookies.keys() if 'cf' in k.lower() or k.startswith('__cf')]
-                if cf_cookies_found:
-                    logger.debug(f"Cloudflare cookies from cloudscraper: {cf_cookies_found}")
-                else:
-                    logger.warning("No Cloudflare cookies found in cloudscraper response")
-                
-                # CRITICAL: Verify we got cf_clearance cookie (required for Cloudflare bypass)
-                cf_clearance = cloudscraper_cookies.get('cf_clearance')
-                if not cf_clearance:
-                    # Try to get it from response cookies (sometimes it's in the cookie jar but not in dict)
-                    for cookie in scraper.cookies:
-                        if cookie.name == 'cf_clearance':
-                            cf_clearance = cookie.value
-                            cloudscraper_cookies['cf_clearance'] = cookie.value
-                            logger.debug(f"Found cf_clearance in cookie jar (length: {len(cf_clearance)})")
-                            break
-                
-                # If cloudscraper didn't get cf_clearance, use the one from saved cookies (Option A)
-                # This can happen if Cloudflare isn't showing a challenge (cookies already valid)
-                if not cf_clearance and self._login_cookies:
-                    cf_clearance = self._login_cookies.get('cf_clearance')
-                    if cf_clearance:
-                        cloudscraper_cookies['cf_clearance'] = cf_clearance
-                        logger.warning("Using cf_clearance from saved cookies (cloudscraper didn't get one)")
-                
-                # If still no cf_clearance, log warning but continue
-                # Cloudflare might not be showing a challenge, or the browser might work without it
-                if not cf_clearance:
-                    logger.warning("cf_clearance cookie not obtained from cloudscraper or saved cookies, proceeding anyway")
-                else:
-                    logger.debug(f"Got cf_clearance cookie (length: {len(cf_clearance)})")
-                
-                # If we have login cookies, merge them (but Cloudflare cookies take precedence)
-                if self._login_cookies:
-                    # Keep Cloudflare cookies, add login cookies that aren't Cloudflare-related
-                    for k, v in self._login_cookies.items():
-                        if 'cf' not in k.lower() and not k.startswith('__cf'):
-                            cloudscraper_cookies[k] = v
-                    logger.debug(f"Merged {len(self._login_cookies)} login cookies with fresh Cloudflare cookies")
-                else:
-                    logger.debug("No login cookies to merge")
-            
-            # Get ALL cookies from cloudscraper (not just Cloudflare ones)
-            # Cloudflare cookies are critical, but other cookies may also be needed
-            self._cloudscraper_cookies = cloudscraper_cookies
-            if self._cloudscraper_cookies:
-                logger.info(f"Cloudflare challenge solved - got {len(self._cloudscraper_cookies)} cookies")
-                
-                # Verify we got critical Cloudflare cookies
-                cf_clearance = self._cloudscraper_cookies.get('cf_clearance')
-                cf_bm = self._cloudscraper_cookies.get('__cf_bm')
-                if not cf_clearance:
-                    logger.warning("cf_clearance cookie missing - Cloudflare may still block, continuing anyway")
-                else:
-                    logger.debug(f"cf_clearance cookie obtained (length: {len(cf_clearance)})")
-                if not cf_bm:
-                    logger.warning("__cf_bm cookie not found (may still work)")
-                
-                cf_cookies = [k for k in self._cloudscraper_cookies.keys() if 'cf' in k.lower() or k.startswith('__cf')]
-                logger.debug(f"Cloudflare cookies obtained: {cf_cookies}")
-            else:
-                logger.warning("No cookies obtained from cloudscraper")
-        except Exception as e:
-            # Cloudscraper failure - log but don't raise if we're in browser mode
-            # Browser will handle Cloudflare challenge directly
-            error_msg = f"Cloudscraper failed to solve Cloudflare challenge: {str(e)}"
-            logger.warning(error_msg)
-            # Only raise if we absolutely need cloudscraper (no cookies, no persistent context)
-            # Otherwise, let browser handle it
-            raise Exception(error_msg)
+    # Method _should_inject_cookies moved to CookieInjector class
+    # Method _inject_cookies_into_context moved to CookieInjector class
+    # Method _pre_authenticate_with_cloudscraper moved to CloudflareHandler class
     
     def start(self, debug_network: bool = False) -> None:
         """Start browser and initialize context - optimized with proper wait strategies"""
@@ -632,20 +127,13 @@ class PerplexityWebDriver:
         # Pre-authenticate with cloudscraper to get fresh Cloudflare cookies
         # Skip if using persistent context (cookies persist) OR if we have login cookies (browser will handle Cloudflare)
         # Only use cloudscraper if we have no cookies and no persistent context
-        if not self.user_data_dir and not self._login_cookies:
-            if not CLOUDSCRAPER_AVAILABLE:
-                logger.warning(
-                    "Cloudscraper not available - browser will handle Cloudflare challenge directly. "
-                    "This may be slower but should work."
-                )
-            else:
-                try:
-                    self._pre_authenticate_with_cloudscraper()
-                except Exception as e:
-                    logger.warning(f"Cloudscraper pre-authentication failed: {e}")
-                    logger.warning("Continuing with browser - it will handle Cloudflare challenge directly")
-                    # Clear any partial cloudscraper cookies
-                    self._cloudscraper_cookies = None
+        if not self.user_data_dir and not self.cookie_injector.get_current_cookies():
+            try:
+                cookies = self.cloudflare_handler.solve_challenge()
+                self.cookie_injector.set_cloudscraper_cookies(cookies)
+            except Exception as e:
+                logger.warning(f"Cloudscraper pre-authentication failed: {e}")
+                logger.warning("Continuing with browser - it will handle Cloudflare challenge directly")
         
         # Use Camoufox if available (better Cloudflare evasion), otherwise fall back to Firefox
         # According to https://camoufox.com/python/usage/, Camoufox is used as a context manager
@@ -665,6 +153,7 @@ class PerplexityWebDriver:
             try:
                 # Virtual display only works on Linux
                 # On Windows/Mac, use regular headless mode
+                headless_mode: Union[str, bool]
                 if self.headless:
                     if is_linux:
                         headless_mode = "virtual"  # Virtual display (Linux only)
@@ -749,8 +238,9 @@ class PerplexityWebDriver:
             }
         
         # Use cloudscraper's user agent if available (matches browser emulation)
-        if self._cloudscraper_user_agent:
-            context_options['user_agent'] = self._cloudscraper_user_agent
+        cloudscraper_ua = self.cloudflare_handler.get_user_agent()
+        if cloudscraper_ua:
+            context_options['user_agent'] = cloudscraper_ua
             logger.debug("Using cloudscraper's user agent in Playwright context")
         else:
             # Fallback to default Firefox user agent (matches Camoufox)
@@ -820,7 +310,7 @@ class PerplexityWebDriver:
             self.context.on("response", log_response)
         
         # Inject cookies into context BEFORE creating pages - only if needed
-        self._inject_cookies_into_context()
+        self.cookie_injector.inject_cookies_into_context(self.context, self.user_data_dir)
         
         # No need to wait after cookie injection - context.add_cookies is synchronous
         
@@ -840,8 +330,8 @@ class PerplexityWebDriver:
             raise Exception("Browser not started")
         
         # Inject cookies if needed (only if not using persistent context)
-        if self.context and self._should_inject_cookies():
-            self._inject_cookies_into_context()
+        if self.context:
+            self.cookie_injector.inject_cookies_into_context(self.context, self.user_data_dir)
         
         # Navigate with fast wait strategy - use domcontentloaded for speed
         # Total wait time should be 2-3 seconds max
@@ -944,9 +434,9 @@ class PerplexityWebDriver:
                             target_page.wait_for_timeout(1000)
                             
                             # Re-inject cookies after refresh
-                            if self.context and self._should_inject_cookies():
+                            if self.context:
                                 logger.debug("Re-injecting cookies after refresh attempt")
-                                self._inject_cookies_into_context()
+                                self.cookie_injector.inject_cookies_into_context(self.context, self.user_data_dir)
                         except Exception as e:
                             logger.warning(f"Could not refresh session: {e}")
                 else:
