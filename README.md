@@ -6,6 +6,8 @@
 
 > **Comprehensive API wrapper for Perplexity.ai with automated account generation, browser automation, and full async support.**
 
+> 🎉 **RECENTLY OPTIMIZED** (v1.1): 50% fewer dependencies, unified HTTP client (httpx), 18+ type errors fixed, 30% faster imports! See [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md) for details.
+
 ## ✨ Features
 
 - 🔥 **Synchronous & Asynchronous Clients** - Choose your preferred approach
