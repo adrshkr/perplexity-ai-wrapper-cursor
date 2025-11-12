@@ -142,6 +142,25 @@ class PerplexityWebDriver:
         if not PLAYWRIGHT_AVAILABLE:
             raise ImportError("Playwright is not installed")
 
+        # Set up signal handlers for graceful cleanup
+        import atexit
+        import signal
+
+        def cleanup_handler(signum=None, frame=None):
+            """Handle cleanup on signals"""
+            try:
+                self.close()
+            except Exception:
+                pass
+
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, cleanup_handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, cleanup_handler)
+
+        # Register exit handler
+        atexit.register(cleanup_handler)
+
         # Pre-authenticate with cloudscraper to get fresh Cloudflare cookies
         # Skip if using persistent context (cookies persist) OR if we have login cookies (browser will handle Cloudflare)
         # Only use cloudscraper if we have no cookies and no persistent context
@@ -2778,82 +2797,186 @@ The conversation should be visible in your browser window.
         )
 
     def close(self) -> None:
-        """Close browser and cleanup - suppress all errors"""
-        # Suppress warnings and stderr output during cleanup
+        """Close browser and cleanup - suppress all errors and handle manual browser closure"""
         import os
         import sys
+        import time
         import warnings
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
         warnings.filterwarnings("ignore")
 
         # Redirect stderr to devnull to suppress Playwright/Camoufox cleanup errors
         old_stderr = sys.stderr
+        devnull = None
         try:
-            sys.stderr = open(os.devnull, "w")
+            devnull = open(os.devnull, "w")
+            sys.stderr = devnull
         except Exception:
             pass
 
-        try:
-            if self.tab_manager:
-                self.tab_manager.close_all()
-                self.tab_manager = None
-        except Exception:
-            pass
+        def cleanup_with_timeout(func, timeout=5):
+            """Execute cleanup function with timeout"""
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(func)
+                    future.result(timeout=timeout)
+            except TimeoutError:
+                logger.debug(f"Cleanup function timed out after {timeout} seconds")
+            except Exception as e:
+                # Specifically ignore EPIPE and related errors
+                if not any(
+                    err in str(e).lower()
+                    for err in ["epipe", "broken pipe", "connection", "pipe"]
+                ):
+                    logger.debug(f"Cleanup error (ignored): {e}")
 
+        # Check if browser was already closed manually
+        browser_already_closed = False
         try:
-            if self.page:
+            if self.browser and hasattr(self.browser, "is_connected"):
+                browser_already_closed = not self.browser.is_connected()
+            elif self.page:
+                browser_already_closed = self.page.is_closed()
+        except Exception:
+            browser_already_closed = True
+
+        if browser_already_closed:
+            logger.debug("Browser already closed manually, skipping cleanup")
+
+        # Close tab manager with timeout
+        if self.tab_manager and not browser_already_closed:
+            cleanup_with_timeout(lambda: self.tab_manager.close_all())
+        self.tab_manager = None
+
+        # Close page with timeout
+        if self.page and not browser_already_closed:
+
+            def close_page():
                 try:
                     if not self.page.is_closed():
                         self.page.close()
-                except Exception:
-                    pass
-                self.page = None
-        except Exception:
-            pass
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    if "epipe" in str(e).lower() or "broken pipe" in str(e).lower():
+                        pass  # Ignore EPIPE errors
+                    else:
+                        raise
 
-        try:
-            if self.context:
-                self.context.close()
-                self.context = None
-        except Exception:
-            pass
+            cleanup_with_timeout(close_page)
+        self.page = None
 
-        try:
-            if self.browser:
-                self.browser.close()
-                self.browser = None
-        except Exception:
-            pass
+        # Close context with timeout
+        if self.context and not browser_already_closed:
 
-        try:
-            # If using Camoufox, exit the context manager properly
-            if self._camoufox:
+            def close_context():
+                try:
+                    self.context.close()
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    if "epipe" in str(e).lower() or "broken pipe" in str(e).lower():
+                        pass  # Ignore EPIPE errors
+                    else:
+                        raise
+
+            cleanup_with_timeout(close_context)
+        self.context = None
+
+        # Close browser with timeout
+        if self.browser and not browser_already_closed:
+
+            def close_browser():
+                try:
+                    self.browser.close()
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    if "epipe" in str(e).lower() or "broken pipe" in str(e).lower():
+                        pass  # Ignore EPIPE errors
+                    else:
+                        raise
+
+            cleanup_with_timeout(close_browser)
+        self.browser = None
+
+        # Handle Camoufox/Playwright cleanup with timeout
+        if self._camoufox and not browser_already_closed:
+
+            def close_camoufox():
                 try:
                     self._camoufox.__exit__(None, None, None)
-                except Exception:
-                    pass
-                self._camoufox = None
-            elif self.playwright:
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    if "epipe" in str(e).lower() or "broken pipe" in str(e).lower():
+                        pass  # Ignore EPIPE errors
+                    else:
+                        raise
+
+            cleanup_with_timeout(close_camoufox, timeout=3)
+        self._camoufox = None
+
+        if self.playwright and not browser_already_closed:
+
+            def close_playwright():
                 try:
                     self.playwright.stop()
-                except Exception:
-                    pass
-                self.playwright = None
-        except Exception:
-            pass
+                except (BrokenPipeError, ConnectionError, OSError) as e:
+                    if "epipe" in str(e).lower() or "broken pipe" in str(e).lower():
+                        pass  # Ignore EPIPE errors
+                    else:
+                        raise
+
+            cleanup_with_timeout(close_playwright, timeout=3)
+        self.playwright = None
 
         # Small delay to ensure cleanup completes
         try:
-            import time
-
             time.sleep(0.1)
         except Exception:
             pass
-        finally:
-            # Restore stderr
-            try:
-                if sys.stderr != old_stderr:
-                    sys.stderr.close()
-                sys.stderr = old_stderr
-            except Exception:
-                pass
+
+        # Restore stderr
+        try:
+            sys.stderr = old_stderr
+            if devnull:
+                devnull.close()
+        except Exception:
+            pass
+
+        # Force cleanup any remaining processes
+        try:
+            import psutil
+
+            # Kill any remaining playwright processes
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    if proc.info["name"] and "node" in proc.info["name"].lower():
+                        cmdline = " ".join(proc.info["cmdline"] or [])
+                        if (
+                            "playwright" in cmdline.lower()
+                            or "firefox" in cmdline.lower()
+                        ):
+                            proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except ImportError:
+            # psutil not available, skip process cleanup
+            pass
+        except Exception:
+            # Any other error in process cleanup, ignore
+            pass
+
+    def __del__(self):
+        """Destructor to ensure cleanup on object deletion"""
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup"""
+        try:
+            self.close()
+        except Exception:
+            pass
+        # Don't suppress exceptions
+        return False
