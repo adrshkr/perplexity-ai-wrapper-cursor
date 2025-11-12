@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$Query,  # Required: Your search query
     [string]$Mode = "api",  # "api" or "browser" (default: api)
-    [string]$CookieProfile = "fresh",
+    [string]$Profile = "fresh",
     [switch]$Headless,
     [switch]$KeepBrowserOpen,
     [switch]$DebugMode,  # Enable debug logging
@@ -30,14 +30,15 @@ if ($Mode -eq "api") {
     python -m src.interfaces.cli search "$Query" --format text
 } else {
     # Build command arguments array properly
-    $cmdArgs = @("browser-search", "$Query", "--profile", "$CookieProfile")
-
+    $cmdArgs = @("browser-search", "$Query", "--profile", "$Profile")
+    
     if ($Headless) { $cmdArgs += "--headless" }
     if ($KeepBrowserOpen) { $cmdArgs += "--keep-browser-open" }
     if ($DebugMode) { $cmdArgs += "--debug" }
     if ($ExportMarkdown) { $cmdArgs += "--export-markdown" }
     if ($ExportDir) { $cmdArgs += "--export-dir"; $cmdArgs += "$ExportDir" }
-
+    
     # Execute with proper argument separation
     & python -m src.interfaces.cli $cmdArgs
 }
+

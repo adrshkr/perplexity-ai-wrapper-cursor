@@ -1,13 +1,15 @@
 # ============================================================================
-# requirements.txt - Optimized Dependencies
+# requirements.txt - All Dependencies
 # ============================================================================
 
-# Core HTTP/Async (Unified with httpx for both sync/async)
+# Core HTTP/Async
+requests>=2.31.0
+aiohttp>=3.9.0
 httpx>=0.25.0
 
-# Web Automation (Playwright only - more modern and efficient)
+# Web Automation
 playwright>=1.40.0
-camoufox>=0.3.0  # Better Cloudflare evasion
+selenium>=4.15.0
 
 # Cookie Management
 browser-cookie3>=0.19.0
@@ -23,27 +25,50 @@ pydantic>=2.5.0
 
 # CLI & UI
 rich>=13.7.0
+colorama>=0.4.6
 click>=8.1.0
+prompt-toolkit>=3.0.0
 
 # Async Utilities
 asyncio-throttle>=1.0.0
 aiofiles>=23.0.0
 
-# Logging
+# Logging & Monitoring
 loguru>=0.7.0
 
 # Rate Limiting
 ratelimit>=2.2.0
 
-# Image Processing (Optional)
-pillow>=10.1.0
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
 
-# Cloudflare Bypass Dependencies (via cloudscraper submodule)
-js2py>=0.74
-pycryptodome>=3.20.0
-brotli>=1.1.0
-requests-toolbelt>=1.0.0
-pyparsing>=3.1.0
-pyOpenSSL>=24.0.0
-websocket-client>=1.7.0
-certifi>=2024.2.2
+# Type Checking
+mypy>=1.7.0
+types-requests>=2.31.0
+
+# Documentation
+sphinx>=7.2.0
+sphinx-rtd-theme>=2.0.0
+
+# Development
+black>=23.11.0
+flake8>=6.1.0
+isort>=5.12.0
+
+# Optional: Advanced Features
+websockets>=12.0  # For real-time streaming
+pillow>=10.1.0    # For image handling
+python-magic>=0.4.27  # For file type detection
+
+# Cloudflare Bypass (via cloudscraper submodule)
+# Note: cloudscraper is added as git submodule, but these are its dependencies
+js2py>=0.74  # JavaScript interpreter for Cloudflare challenges
+pycryptodome>=3.20.0  # Cryptographic functions
+brotli>=1.1.0  # Brotli compression support
+requests-toolbelt>=1.0.0  # Additional request utilities
+pyparsing>=3.1.0  # Parsing utilities
+pyOpenSSL>=24.0.0  # SSL/TLS support
+websocket-client>=1.7.0  # WebSocket support
+certifi>=2024.2.2  # SSL certificates
