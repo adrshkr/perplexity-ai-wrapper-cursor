@@ -1,0 +1,37 @@
+# Perplexity AI Wrapper Configuration
+
+client:
+  base_url: "https://www.perplexity.ai"
+  timeout: 30
+  max_retries: 3
+
+search:
+  available_modes:
+    - "auto"
+    - "pro"
+    - "reasoning"
+    - "deep_research"
+
+logging:
+  level: "INFO"
+  file: "logs/perplexity_wrapper.log"
+
+automation:
+  browser:
+    headless: false
+    stealth: true
+
+cloudflare_bypass:
+  enabled: true
+  stealth_mode: true
+  stealth_options:
+    min_delay: 1.0
+    max_delay: 3.0
+    human_like_delays: true
+    randomize_headers: true
+    browser_quirks: true
+  interpreter: js2py  # Options: js2py, nodejs, native
+  auto_refresh_on_403: true
+  max_403_retries: 3
+  session_refresh_interval: 3600
+  proxy_rotation: []  # Optional list of proxy URLs
