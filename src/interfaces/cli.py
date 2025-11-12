@@ -781,7 +781,8 @@ def browser(headless, user_data_dir, profile, persistent):
 @click.option('--image-dir', type=click.Path(), default='_resources', help='Directory to save images (default: _resources)')
 @click.option('--export-markdown', is_flag=True, help='Export thread as Markdown file after search completes')
 @click.option('--export-dir', type=click.Path(), help='Directory to save exported Markdown file (default: exports/)')
-def browser_search(query, profile, headless, output, user_data_dir, persistent, debug, keep_browser_open, extract_images, image_dir, export_markdown, export_dir):
+@click.option('--mode', '-m', type=click.Choice(['search', 'research', 'labs']), default='search', help='Search mode: search (default), research, or labs')
+def browser_search(query, profile, headless, output, user_data_dir, persistent, debug, keep_browser_open, extract_images, image_dir, export_markdown, export_dir, mode):
     """
     Search using browser automation (bypasses Cloudflare)
     
@@ -901,10 +902,19 @@ def browser_search(query, profile, headless, output, user_data_dir, persistent, 
         
         # Perform search programmatically with structured output
         try:
+            # Adjust timeout based on mode: Research (5 min), Labs (16 min), Search (2 min)
+            mode_timeouts = {
+                'research': 300000,  # 5 minutes
+                'labs': 960000,      # 16 minutes
+                'search': 120000     # 2 minutes
+            }
+            search_timeout = mode_timeouts.get(mode.lower(), 120000)
+            
             result = driver.search(
-                query, 
+                query,
+                mode=mode,
                 wait_for_response=True, 
-                timeout=120000,
+                timeout=search_timeout,
                 extract_images=extract_images,
                 image_dir=image_dir if extract_images else None,
                 structured=True
