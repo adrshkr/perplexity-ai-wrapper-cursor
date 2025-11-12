@@ -6,9 +6,11 @@ param(
     [string]$Query,  # Required: Your search query
     [string]$Mode = "api",  # "api" or "browser" (default: api)
     [string]$CookieProfile = "fresh",
+    [string]$SearchMode = "search",  # "search", "research", or "labs" (default: search)
     [switch]$Headless,
     [switch]$KeepBrowserOpen,
     [switch]$DebugMode,  # Enable debug logging
+    [switch]$Research,   # Enable research mode
     [switch]$ExportMarkdown,  # Export thread as Markdown file after search
     [string]$ExportDir = ""  # Directory to save exported Markdown (default: exports/)
 )
@@ -16,6 +18,11 @@ param(
 # Change to script directory
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $scriptDir
+
+# Set search mode based on Research flag
+if ($Research) {
+    $SearchMode = "research"
+}
 
 # Activate venv if it exists
 if (Test-Path "venv\Scripts\Activate.ps1") {
@@ -27,10 +34,10 @@ if (Test-Path "venv\Scripts\Activate.ps1") {
 }
 
 if ($Mode -eq "api") {
-    python -m src.interfaces.cli search "$Query" --format text
+    python -m src.interfaces.cli search "$Query" --format text --mode $SearchMode
 } else {
     # Build command arguments array properly
-    $cmdArgs = @("browser-search", "$Query", "--profile", "$CookieProfile")
+    $cmdArgs = @("browser-search", "$Query", "--profile", "$CookieProfile", "--mode", "$SearchMode")
 
     if ($Headless) { $cmdArgs += "--headless" }
     if ($KeepBrowserOpen) { $cmdArgs += "--keep-browser-open" }
