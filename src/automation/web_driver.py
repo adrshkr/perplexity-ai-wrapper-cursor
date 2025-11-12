@@ -2632,105 +2632,97 @@ class PerplexityWebDriver:
         except Exception as e:
             logger.debug(f"Strategy 2 failed: {e}")
 
-        # Strategy 3: Manual content extraction and markdown creation
+        # Strategy 3: Manual content extraction with improved formatting
         try:
-            logger.debug("Strategy 3: Manual content extraction...")
+            logger.debug(
+                "Strategy 3: Manual content extraction with improved formatting..."
+            )
 
-            # Extract conversation content with improved logic
-            content = target_page.evaluate("""
-                () => {
-                    // Try to find the main conversation area
-                    const selectors = [
-                        '[data-testid="conversation-messages"]',
-                        '.conversation-content',
-                        '[role="main"] .prose',
-                        'main [data-testid*="answer"]',
-                        'main .markdown',
-                        'main article',
-                        'main .thread-content'
-                    ];
+            # Use the improved get_response_text method for better content extraction
+            try:
+                # Temporarily store current page
+                original_page = self.page
+                self.page = target_page
 
-                    let container = null;
-                    for (const selector of selectors) {
-                        const elem = document.querySelector(selector);
-                        if (elem && elem.innerText && elem.innerText.length > 100) {
-                            container = elem;
-                            break;
-                        }
-                    }
+                # Extract content using our improved method
+                extracted_content = self.get_response_text(
+                    extract_images=False,
+                    query=None,  # We don't have query context here
+                    previous_answers=None,
+                )
 
-                    // Fallback to main element
-                    if (!container) {
-                        container = document.querySelector('main');
-                    }
+                # Restore page
+                self.page = original_page
 
-                    if (!container) {
-                        return null;
-                    }
+            except Exception as extraction_error:
+                logger.debug(f"get_response_text failed: {extraction_error}")
+                extracted_content = ""
 
-                    // Extract text with basic formatting preservation
-                    const extractText = (element) => {
-                        let text = '';
+            # If our method didn't work, fall back to basic extraction
+            if not extracted_content or len(extracted_content) < 200:
+                content = target_page.evaluate("""
+                    () => {
+                        const main = document.querySelector('main');
+                        if (!main) return '';
 
-                        for (const node of element.childNodes) {
-                            if (node.nodeType === Node.TEXT_NODE) {
-                                text += node.textContent;
-                            } else if (node.nodeType === Node.ELEMENT_NODE) {
-                                const tagName = node.tagName.toLowerCase();
+                        // Get text content but preserve basic structure
+                        let text = main.innerText || main.textContent || '';
 
-                                if (tagName === 'br') {
-                                    text += '\\n';
-                                } else if (tagName === 'p') {
-                                    text += extractText(node) + '\\n\\n';
-                                } else if (tagName.match(/^h[1-6]$/)) {
-                                    const level = parseInt(tagName[1]);
-                                    const prefix = '#'.repeat(level);
-                                    text += prefix + ' ' + extractText(node) + '\\n\\n';
-                                } else if (tagName === 'ul' || tagName === 'ol') {
-                                    text += extractText(node) + '\\n';
-                                } else if (tagName === 'li') {
-                                    text += '- ' + extractText(node) + '\\n';
-                                } else if (tagName === 'a') {
-                                    const href = node.getAttribute('href');
-                                    const linkText = extractText(node);
-                                    if (href && href.startsWith('http')) {
-                                        text += `[${linkText}](${href})`;
-                                    } else {
-                                        text += linkText;
-                                    }
-                                } else if (tagName === 'strong' || tagName === 'b') {
-                                    text += '**' + extractText(node) + '**';
-                                } else if (tagName === 'em' || tagName === 'i') {
-                                    text += '*' + extractText(node) + '*';
-                                } else {
-                                    text += extractText(node);
-                                }
+                        // Basic cleanup
+                        text = text.replace(/\\n{3,}/g, '\\n\\n').trim();
+
+                        // Remove obvious UI elements at start/end
+                        const lines = text.split('\\n');
+                        let startIdx = 0, endIdx = lines.length;
+
+                        // Skip UI header elements
+                        for (let i = 0; i < Math.min(10, lines.length); i++) {
+                            const line = lines[i].trim().toLowerCase();
+                            if (line && !['home', 'discover', 'library', 'pro', 'sign in'].includes(line)) {
+                                startIdx = i;
+                                break;
                             }
                         }
 
-                        return text;
-                    };
+                        // Stop before Related/Sources sections
+                        for (let i = startIdx; i < lines.length; i++) {
+                            const line = lines[i].trim().toLowerCase();
+                            if (line === 'related' || line.startsWith('related ') ||
+                                line.includes('sources') && line.length < 50) {
+                                endIdx = i;
+                                break;
+                            }
+                        }
 
-                    const fullText = extractText(container);
+                        return lines.slice(startIdx, endIdx).join('\\n').trim();
+                    }
+                """)
+                extracted_content = content
 
-                    // Clean up the text
-                    return fullText
-                        .replace(/\\n{3,}/g, '\\n\\n')  // Reduce multiple newlines
-                        .replace(/\\s+$/, '')           // Remove trailing whitespace
-                        .trim();
-                }
-            """)
-
-            if content and len(content) > 200:
-                # Create markdown content with header
-                markdown_content = f"""# Perplexity Conversation Export
+            if extracted_content and len(extracted_content) > 100:
+                # Create well-formatted markdown content
+                markdown_content = f"""# Perplexity Search Results
 
 **Exported:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 **Source:** {target_page.url}
 
 ---
 
-{content}
+## Answer
+
+{extracted_content}
+
+---
+
+## Notes
+
+- This content was extracted using manual methods as the automatic export failed
+- The formatting has been cleaned to separate the main answer from UI elements
+- Related questions and sources sections have been filtered out for clarity
+
+---
+
+*Exported from Perplexity AI*
 """
 
                 # Write to file
@@ -2738,7 +2730,7 @@ class PerplexityWebDriver:
                     f.write(markdown_content)
 
                 logger.info(
-                    f"Successfully exported via manual extraction: {export_path}"
+                    f"Successfully exported via improved manual extraction: {export_path}"
                 )
                 return export_path
             else:
