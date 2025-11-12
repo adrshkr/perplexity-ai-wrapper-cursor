@@ -399,7 +399,6 @@ class FunctionalityAuditor:
             ],
             "src/interfaces/cli.py": [
                 "browser-search",
-                "click.command",
                 "@cli.command",
                 "PerplexityWebDriver",
                 "browser automation",
@@ -545,7 +544,7 @@ class FunctionalityAuditor:
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and node.name == class_name:
                 for item in node.body:
-                    if isinstance(item, ast.FunctionDef):
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         params = [arg.arg for arg in item.args.args]
                         methods[item.name] = params
                 break
