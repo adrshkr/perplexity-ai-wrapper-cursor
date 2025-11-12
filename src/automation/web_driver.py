@@ -1945,24 +1945,41 @@ class PerplexityWebDriver:
                     // Extract text from ALL containers and combine them
                     for (const containerInfo of filteredContainers) {
                         const container = containerInfo.container;
-                        let containerText = nodeToMarkdown(container);
+
+                        // Check if this container contains "Related" section and should be excluded
+                        const containerText = container.innerText || container.textContent || '';
+                        const containerLower = containerText.toLowerCase();
+
+                        // Skip containers that are clearly Related questions or Sources
+                        if (containerLower.includes('related') && containerText.length < 500) {
+                            console.log('[DEBUG] Skipping Related section container');
+                            continue;
+                        }
+                        if (containerLower.includes('sources') && containerText.length < 300) {
+                            console.log('[DEBUG] Skipping Sources section container');
+                            continue;
+                        }
+
+                        let extractedText = nodeToMarkdown(container);
 
                         // Clean up the text
-                        containerText = containerText.replace(/\\n{3,}/g, '\\n\\n').trim();
+                        extractedText = extractedText.replace(/\\n{3,}/g, '\\n\\n').trim();
 
                         // Remove citation markers (like "source+1", "example.com+2")
-                        containerText = containerText.replace(/[a-zA-Z0-9.-]+\\+\\d+[^\\w\\s]*/g, '').trim();
+                        extractedText = extractedText.replace(/[a-zA-Z0-9.-]+\\+\\d+[^\\w\\s]*/g, '').trim();
 
                         // Remove zero-width spaces and other problematic characters
-                        containerText = containerText.replace(/\\u200b/g, '').replace(/\\u200c/g, '').replace(/\\u200d/g, '');
+                        extractedText = extractedText.replace(/\\u200b/g, '').replace(/\\u200c/g, '').replace(/\\u200d/g, '');
 
-                        // GET EVERYTHING - but skip query text at the start
-                        const lines = containerText.split('\\n').filter(l => l.trim().length > 0);
+                        // Split into lines and process
+                        const lines = extractedText.split('\\n').filter(l => l.trim().length > 0);
 
                         // Find where actual answer starts (skip query text and UI elements)
                         let startIndex = 0;
+                        let endIndex = lines.length;
                         const queryStart = queryText ? queryText.toLowerCase().substring(0, 30) : '';
 
+                        // Find start of answer content
                         for (let i = 0; i < Math.min(20, lines.length); i++) {
                             const line = lines[i].trim().toLowerCase();
 
@@ -1988,33 +2005,62 @@ class PerplexityWebDriver:
                                 line.includes('latest cryptocurrency') ||
                                 line.includes('major news') ||
                                 line.includes('upcoming events') ||
-                                line.includes('market sentiment')) {
+                                line.includes('current market')) {
                                 startIndex = i;
                                 break;
                             }
                         }
 
-                        // Get all content from startIndex onwards - don't filter aggressively
-                        const cleanedText = lines.slice(startIndex).join('\\n').trim();
+                        // Find end of main answer content (before Related/Sources sections)
+                        for (let i = startIndex; i < lines.length; i++) {
+                            const line = lines[i].trim().toLowerCase();
+
+                            // Stop at Related section
+                            if (line === 'related' || line.startsWith('related ') || line === '## related' || line === '### related') {
+                                console.log(`[DEBUG] Found Related section at line ${i}, stopping extraction here`);
+                                endIndex = i;
+                                break;
+                            }
+
+                            // Stop at Sources section
+                            if (line.includes('sources') && line.length < 50) {
+                                console.log(`[DEBUG] Found Sources section at line ${i}, stopping extraction here`);
+                                endIndex = i;
+                                break;
+                            }
+
+                            // Stop at other common end-of-content markers
+                            if (line.includes('follow-up') || line.includes('ask another') || line.includes('more questions')) {
+                                endIndex = i;
+                                break;
+                            }
+                        }
+
+                        // Get content from startIndex to endIndex (excluding Related/Sources)
+                        const contentLines = lines.slice(startIndex, endIndex);
+                        let finalText = contentLines.join('\\n').trim();
 
                         // Additional cleanup: remove query text if it appears at the start
-                        let finalText = cleanedText;
                         if (queryText && finalText.toLowerCase().startsWith(queryText.toLowerCase().substring(0, 50))) {
-                            // Find where the actual answer starts (after the query)
-                            const queryLines = queryText.toLowerCase().split('\\n');
-                            const firstQueryLine = queryLines[0].substring(0, Math.min(50, queryLines[0].length));
                             const textLines = finalText.split('\\n');
                             let answerStartIndex = 0;
-                            for (let i = 0; i < Math.min(10, textLines.length); i++) {
-                                const line = textLines[i].toLowerCase();
-                                // Skip lines that contain query text
-                                if (line.includes(firstQueryLine.substring(0, 30))) {
-                                    answerStartIndex = i + 1;
-                                } else if (answerStartIndex > 0 && line.length > 50) {
-                                    // Found first real content line after query
+
+                            // Look for answer start markers in the first 10 lines
+                            for (let j = 0; j < Math.min(10, textLines.length); j++) {
+                                const textLine = textLines[j].toLowerCase();
+                                if (textLine.includes('here is a') ||
+                                    textLine.includes('here\\'s a') ||
+                                    textLine.includes('according to') ||
+                                    textLine.includes('based on') ||
+                                    textLine.includes('current') ||
+                                    textLine.includes('latest') ||
+                                    textLine.includes('today') ||
+                                    (textLine.length > 100 && j > 0)) {
+                                    answerStartIndex = j;
                                     break;
                                 }
                             }
+
                             if (answerStartIndex > 0) {
                                 finalText = textLines.slice(answerStartIndex).join('\\n').trim();
                             }
@@ -2025,38 +2071,47 @@ class PerplexityWebDriver:
                         }
                     }
 
-                    console.log(`[TELEMETRY] Combining ${allTextParts.length} text parts into final answer`);
+                    console.log(`[TELEMETRY] Combining ${allTextParts.length} text parts into final answer (excluding Related/Sources)`);
                     for (let i = 0; i < allTextParts.length; i++) {
                         console.log(`[TELEMETRY] Part ${i+1}: ${allTextParts[i].length} chars, preview="${allTextParts[i].substring(0, 80).replace(/\\n/g, ' ')}..."`);
                     }
 
-                    // Combine all parts with proper spacing - GET EVERYTHING
+                    // Combine all parts with proper spacing
                     let combinedText = allTextParts.join('\\n\\n').trim();
 
                     console.log(`[TELEMETRY] Combined text length: ${combinedText.length} characters`);
 
-                    // Minimal cleanup: just remove excessive newlines, keep all content
+                    // Final cleanup: remove excessive newlines and ensure clean separation
                     combinedText = combinedText.replace(/\\n{4,}/g, '\\n\\n\\n').trim();
 
                     // Remove duplicate content only if it's exact duplicates (containers overlap)
                     const lines = combinedText.split('\\n');
                     const finalLines = [];
-                    const seenExactLines = new Set();
+                    const seenLines = new Set();
+
                     for (const line of lines) {
-                        const lineTrimmed = line.trim();
-                        // Only skip if it's an exact duplicate of a previous line
-                        if (lineTrimmed.length > 0) {
-                            if (!seenExactLines.has(lineTrimmed.toLowerCase())) {
-                                seenExactLines.add(lineTrimmed.toLowerCase());
-                                finalLines.push(line);
-                            } else if (lineTrimmed.length > 200) {
-                                // Keep long lines even if similar (might be important)
+                        const trimmed = line.trim();
+                        // Only dedupe if it's an exact match and substantial content
+                        if (trimmed.length > 20) {
+                            if (!seenLines.has(trimmed)) {
+                                seenLines.add(trimmed);
                                 finalLines.push(line);
                             }
+                        } else {
+                            // Always include short lines (formatting, etc.)
+                            finalLines.push(line);
                         }
                     }
 
-                    return finalLines.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+                    // Final result with proper separation
+                    const result = finalLines.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+
+                    // Add clear separator if the answer ends abruptly (helps with formatting)
+                    if (result && !result.endsWith('.') && !result.endsWith('!') && !result.endsWith('?')) {
+                        return result + '\\n\\n---\\n\\n*End of Answer*';
+                    }
+
+                    return result;
                 }
 
                 // Fallback to single container if filteredContainers didn't work
