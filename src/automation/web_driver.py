@@ -98,6 +98,9 @@ if CLOUDSCRAPER_AVAILABLE:
 
 class PerplexityWebDriver:
     """Browser automation for Perplexity.ai using Playwright"""
+    
+    # Cache platform detection (module-level would be called on import)
+    _platform_system = platform.system()
 
     def __init__(
         self,
@@ -124,6 +127,9 @@ class PerplexityWebDriver:
 
         # Mode tracking
         self._current_mode: str = "search"
+        
+        # Track if cookies were injected to avoid redundant injection
+        self._cookies_injected: bool = False
 
         # Extracted components for cleaner architecture
         self.cookie_injector = CookieInjector()
@@ -159,10 +165,8 @@ class PerplexityWebDriver:
         # According to https://camoufox.com/python/usage/, Camoufox is used as a context manager
         # but we can also use it directly and access the browser
         if CAMOUFOX_AVAILABLE and Camoufox is not None:
-            # Detect platform for headless mode selection
-            import platform
-
-            is_linux = platform.system() == "Linux"
+            # Use cached platform detection
+            is_linux = self._platform_system == "Linux"
 
             mode_str = (
                 "headless (virtual display)"
@@ -352,6 +356,7 @@ class PerplexityWebDriver:
         self.cookie_injector.inject_cookies_into_context(
             self.context, self.user_data_dir
         )
+        self._cookies_injected = True  # Mark as injected
 
         # No need to wait after cookie injection - context.add_cookies is synchronous
 
@@ -373,11 +378,12 @@ class PerplexityWebDriver:
         if not target_page:
             raise Exception("Browser not started")
 
-        # Inject cookies if needed (only if not using persistent context)
-        if self.context:
+        # Inject cookies if needed (only if not already injected and not using persistent context)
+        if self.context and not self._cookies_injected:
             self.cookie_injector.inject_cookies_into_context(
                 self.context, self.user_data_dir
             )
+            self._cookies_injected = True
 
         # Navigate with fast wait strategy - use domcontentloaded for speed
         # Total wait time should be 2-3 seconds max
