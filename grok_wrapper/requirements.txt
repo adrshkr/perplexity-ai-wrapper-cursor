@@ -1,0 +1,7 @@
+requests>=2.31.0
+click>=8.1.0
+rich>=13.0.0
+playwright>=1.40.0
+browser-cookie3>=0.19.1
+pygments>=2.16.0  # For syntax highlighting in code blocks
+

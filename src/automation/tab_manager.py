@@ -42,8 +42,20 @@ class TabManager:
                         try:
                             tab.goto("about:blank", wait_until="domcontentloaded", timeout=2000)
                         except Exception:
-                            pass
+                            # Tab is broken - close it and create a new one
+                            try:
+                                if not tab.is_closed():
+                                    tab.close()
+                            except Exception:
+                                pass
+                            tab = self.context.new_page()
                 except Exception:
+                    # Tab is broken - close it and create a new one
+                    try:
+                        if not tab.is_closed():
+                            tab.close()
+                    except Exception:
+                        pass
                     tab = self.context.new_page()
             else:
                 # Create new tab if under limit
@@ -59,6 +71,9 @@ class TabManager:
                         if tab in self.active_tabs:
                             del self.active_tabs[tab]
                     except Exception:
+                        # Remove broken oldest tab from active_tabs before creating new one
+                        if oldest_tab in self.active_tabs:
+                            del self.active_tabs[oldest_tab]
                         tab = self.context.new_page()
             
             # Mark as active
@@ -82,7 +97,9 @@ class TabManager:
                 del self.active_tabs[tab]
             
             if reuse and not tab.is_closed():
-                self.available_tabs.append(tab)
+                # Check if tab is already in available_tabs to prevent duplicates
+                if tab not in self.available_tabs:
+                    self.available_tabs.append(tab)
             else:
                 try:
                     if not tab.is_closed():

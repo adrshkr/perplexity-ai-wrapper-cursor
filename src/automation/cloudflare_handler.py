@@ -103,6 +103,9 @@ class CloudflareHandler:
         Returns:
             Dictionary of cookies or None if failed
         """
+        if CloudflareBypass is None:
+            return None
+        
         try:
             bypass = CloudflareBypass(
                 browser='firefox',
@@ -128,6 +131,8 @@ class CloudflareHandler:
             if bypass.solve_challenge(url):
                 cloudscraper_cookies = bypass.get_cookies_dict()
                 self._merge_login_cookies(cloudscraper_cookies, login_cookies)
+                # Store cookies for get_cookies() method
+                self._cloudscraper_cookies = cloudscraper_cookies
                 return cloudscraper_cookies
             else:
                 raise Exception("Cloudflare challenge solve returned False")
@@ -201,6 +206,9 @@ class CloudflareHandler:
         # Verify critical cookies
         self._verify_cloudflare_cookies(cloudscraper_cookies)
         
+        # Store cookies for get_cookies() method
+        self._cloudscraper_cookies = cloudscraper_cookies
+        
         return cloudscraper_cookies
     
     def _attempt_challenge_solving(self, scraper: Any, url: str) -> Any:
@@ -222,6 +230,11 @@ class CloudflareHandler:
         max_attempts = 10
         response = None
         
+        # Custom exception to signal that retries should stop (not a transient error)
+        class StopRetryingException(Exception):
+            """Exception raised when retries should stop immediately"""
+            pass
+        
         for attempt in range(1, max_attempts + 1):
             logger.debug(f"Cloudflare bypass attempt {attempt}/{max_attempts}")
             
@@ -235,7 +248,8 @@ class CloudflareHandler:
                         time.sleep(wait_time)
                         continue
                     else:
-                        raise Exception(f"Failed after {attempt} attempts with status {response.status_code}")
+                        # Don't retry - raise custom exception that won't be caught by generic handler
+                        raise StopRetryingException(f"Failed after {attempt} attempts with status {response.status_code}")
                 
                 # Check if still on challenge page
                 if self._is_challenge_page(response):
@@ -254,6 +268,9 @@ class CloudflareHandler:
                     time.sleep(wait_time)
                     continue
                     
+            except StopRetryingException:
+                # Re-raise immediately - don't retry on non-retryable errors
+                raise
             except Exception as e:
                 logger.debug(f"Request failed (attempt {attempt}): {e}")
                 if attempt < max_attempts:
@@ -285,7 +302,7 @@ class CloudflareHandler:
     
     def _should_retry(self, status_code: int, attempt: int, max_attempts: int) -> bool:
         """
-        Determine if request should be retried
+        Determine if request should be retried based on status code
         
         Args:
             status_code: HTTP status code
@@ -293,16 +310,42 @@ class CloudflareHandler:
             max_attempts: Maximum attempts allowed
             
         Returns:
-            True if should retry
+            True if should retry, False otherwise
         """
+        # If we get consecutive 403 errors after 5 attempts, stop retrying (IP blocking detected)
         if status_code == 403 and attempt >= 5:
             logger.warning(f"Cloudflare consistently returning 403 after {attempt} attempts")
             logger.warning("This may indicate IP blocking or advanced protection")
-            if attempt >= max_attempts:
+            return False
+        
+        # Don't retry on client errors (4xx) except 429 (rate limiting) and 403 (handled above)
+        if 400 <= status_code < 500:
+            if status_code == 429:
+                # Rate limiting - should retry
+                logger.debug(f"Rate limited (429), retrying (attempt {attempt}/{max_attempts})")
+                return True
+            elif status_code == 403:
+                # 403 before 5 attempts - might be temporary, retry
+                logger.debug(f"403 Forbidden, retrying (attempt {attempt}/{max_attempts})")
+                return True
+            else:
+                # Other 4xx errors (401, 404, 400, etc.) - don't retry
+                logger.warning(f"Client error {status_code} - not retrying (invalid request)")
                 return False
         
-        logger.debug(f"Status {status_code}, waiting and retrying (attempt {attempt}/{max_attempts})")
-        return True
+        # Retry on specific server errors that are likely transient
+        if status_code in [500, 502, 503, 504]:
+            logger.debug(f"Server error {status_code}, retrying (attempt {attempt}/{max_attempts})")
+            return True
+        
+        # Don't retry on other server errors (501, 505, etc.) - likely permanent
+        if 500 <= status_code < 600:
+            logger.warning(f"Server error {status_code} - not retrying (likely permanent)")
+            return False
+        
+        # For any other status code (including 200), don't retry
+        logger.debug(f"Status {status_code} - not retrying")
+        return False
     
     def _is_challenge_page(self, response: Any) -> bool:
         """
@@ -406,7 +449,10 @@ class CloudflareHandler:
             cookies: Dictionary to add cookie to
         """
         try:
-            parts = cookie_header.split(';')[0].split('=')
+            # Use split('=', 1) to handle cookie values containing equals signs
+            # e.g., cf_clearance=abc=def=123 should parse as name='cf_clearance', value='abc=def=123'
+            cookie_part = cookie_header.split(';')[0]
+            parts = cookie_part.split('=', 1)  # Split only on first equals sign
             if len(parts) == 2 and parts[0].strip() == 'cf_clearance':
                 cf_val = parts[1].strip()
                 if cf_val and cf_val not in cookies.values():
@@ -429,7 +475,16 @@ class CloudflareHandler:
         """
         if login_cookies:
             for k, v in login_cookies.items():
-                if 'cf' not in k.lower() and not k.startswith('__cf'):
+                # Check for specific Cloudflare cookie patterns, not just 'cf' substring
+                # This prevents filtering out legitimate cookies like 'csrf_token', 'config', 'scaffold', etc.
+                is_cloudflare_cookie = (
+                    k == 'cf_clearance' or
+                    k.startswith('__cf') or  # __cf_bm, __cfduid, etc.
+                    k.startswith('__Secure-cf_') or  # Secure Cloudflare cookies
+                    (k.startswith('cf_') and k != 'cf_clearance') or  # Other cf_* cookies (rare)
+                    k.startswith('cf_clearance')  # Variants of cf_clearance
+                )
+                if not is_cloudflare_cookie:
                     cloudscraper_cookies[k] = v
             logger.debug(f"Merged {len(login_cookies)} login cookies with fresh Cloudflare cookies")
         else:

@@ -30,6 +30,7 @@ class CookieInjector:
         """
         self._login_cookies = cookies
         self._formatted_cookies_cache = None  # Invalidate cache
+        self._cookies_injected = False  # Reset injection flag to allow re-injection with new cookies
     
     def set_cloudscraper_cookies(self, cookies: Dict[str, str]) -> None:
         """
@@ -40,6 +41,7 @@ class CookieInjector:
         """
         self._cloudscraper_cookies = cookies
         self._formatted_cookies_cache = None  # Invalidate cache
+        self._cookies_injected = False  # Reset injection flag to allow re-injection with new cookies
     
     def should_inject_cookies(self, user_data_dir: Optional[str]) -> bool:
         """
@@ -100,11 +102,11 @@ class CookieInjector:
             self._log_cloudflare_cookies(playwright_cookies)
             
             try:
-                context.add_cookies(playwright_cookies)
+                context.add_cookies(playwright_cookies)  # type: ignore[arg-type]
                 logger.debug(f"Successfully injected {len(playwright_cookies)} cookies")
                 self._verify_cookies_in_context(context)
                 self._cookies_injected = True
-            except Exception as e:
+            except Exception:
                 # Fallback: try individual cookie injection
                 self._inject_cookies_individually(context, playwright_cookies)
     
@@ -125,7 +127,16 @@ class CookieInjector:
         if self._login_cookies:
             for k, v in self._login_cookies.items():
                 # Don't override Cloudflare cookies that we just got from cloudscraper
-                if 'cf' not in k.lower() and not k.startswith('__cf'):
+                # Check for specific Cloudflare cookie patterns, not just 'cf' substring
+                # This prevents filtering out legitimate cookies like 'csrf_token', 'config', 'scaffold', etc.
+                is_cloudflare_cookie = (
+                    k == 'cf_clearance' or
+                    k.startswith('__cf') or  # __cf_bm, __cfduid, etc.
+                    k.startswith('__Secure-cf_') or  # Secure Cloudflare cookies
+                    (k.startswith('cf_') and k != 'cf_clearance') or  # Other cf_* cookies (rare)
+                    k.startswith('cf_clearance')  # Variants of cf_clearance
+                )
+                if not is_cloudflare_cookie:
                     all_cookies[k] = v
         
         return all_cookies
@@ -235,7 +246,9 @@ class CookieInjector:
         
         for cookie in playwright_cookies:
             try:
-                context.add_cookies([cookie])
+                # Type ignore needed because Playwright's SetCookieParam type is more specific
+                # but our dict format is compatible at runtime
+                context.add_cookies([cookie])  # type: ignore[list-item]
                 injected_count += 1
             except Exception as cookie_error:
                 cookie_name = cookie.get('name', 'unknown')

@@ -14,18 +14,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from .cloudflare_handler import CloudflareHandler
 from .cookie_injector import CookieInjector
 
-# Import extracted components
 from .tab_manager import TabManager
 
-# Configure logging
 logger = logging.getLogger(__name__)
-
-# Suppress noisy third-party loggers
 logging.getLogger("playwright").setLevel(logging.WARNING)
 logging.getLogger("camoufox").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-# Try to import camoufox for better Cloudflare evasion
 CAMOUFOX_AVAILABLE = False
 Camoufox: Optional[Any] = None
 try:
@@ -35,13 +29,9 @@ try:
     Camoufox = _Camoufox
 except ImportError:
     CAMOUFOX_AVAILABLE = False
-
-# Import Playwright types only for type checking
 if TYPE_CHECKING:
     from camoufox.sync_api import Camoufox
     from playwright.sync_api import Browser, BrowserContext, Page, Playwright
-
-# Try to import Playwright - only import at runtime, not for type checking
 try:
     from playwright.sync_api import (
         Browser,
@@ -59,47 +49,33 @@ except ImportError:
         BrowserContext = None  # type: ignore
         Page = None  # type: ignore
         Playwright = None  # type: ignore
-
-# Try to import cloudscraper for Cloudflare bypass
 CLOUDSCRAPER_AVAILABLE = False
 CloudflareBypass: Optional[Any] = None
 
 try:
     import cloudscraper  # noqa: F401
-
     CLOUDSCRAPER_AVAILABLE = True
 except ImportError:
-    # Try submodule path
     project_root = Path(__file__).parent.parent.parent
     cloudscraper_path = project_root / "cloudscraper"
     if cloudscraper_path.exists() and str(cloudscraper_path) not in sys.path:
         sys.path.insert(0, str(cloudscraper_path))
     try:
         import cloudscraper  # noqa: F401
-
         CLOUDSCRAPER_AVAILABLE = True
     except ImportError:
         CLOUDSCRAPER_AVAILABLE = False
 
-# Try to import CloudflareBypass wrapper
 if CLOUDSCRAPER_AVAILABLE:
     try:
         from ..utils.cloudflare_bypass import CloudflareBypass as _CloudflareBypass
-
         CloudflareBypass = _CloudflareBypass
     except ImportError:
         CloudflareBypass = None
 
 
-# TabManager is now imported from .tab_manager module
-# CookieInjector is now imported from .cookie_injector module
-# CloudflareHandler is now imported from .cloudflare_handler module
-
-
 class PerplexityWebDriver:
     """Browser automation for Perplexity.ai using Playwright"""
-    
-    # Cache platform detection (module-level would be called on import)
     _platform_system = platform.system()
 
     def __init__(
@@ -116,32 +92,34 @@ class PerplexityWebDriver:
         self.headless = headless
         self.user_data_dir = user_data_dir
         self.stealth_mode = stealth_mode
-
-        # Browser components
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.tab_manager: Optional[TabManager] = None
         self._camoufox: Optional[Any] = None
-
-        # Mode tracking
         self._current_mode: str = "search"
-        
-        # Track if cookies were injected to avoid redundant injection
         self._cookies_injected: bool = False
-
-        # Extracted components for cleaner architecture
+        self._is_headless: bool = headless
         self.cookie_injector = CookieInjector()
         self.cloudflare_handler = CloudflareHandler()
 
     def set_cookies(self, cookies: Dict[str, str]) -> None:
         """Store cookies to be injected before navigation"""
         self.cookie_injector.set_login_cookies(cookies)
-
-    # Method _should_inject_cookies moved to CookieInjector class
-    # Method _inject_cookies_into_context moved to CookieInjector class
-    # Method _pre_authenticate_with_cloudscraper moved to CloudflareHandler class
+    
+    def _safe_bring_to_front(self, page: Page) -> bool:
+        """Safely bring page to front, handling failures gracefully"""
+        if self._is_headless:
+            logger.debug("Skipping bring_to_front in headless mode")
+            return True
+        
+        try:
+            page.bring_to_front()
+            return True
+        except Exception as e:
+            logger.debug(f"bring_to_front failed (window may be in background): {e}")
+            return False
 
     def start(self, debug_network: bool = False) -> None:
         """Start browser and initialize context - optimized with proper wait strategies"""
@@ -339,6 +317,34 @@ class PerplexityWebDriver:
                 }
             """)
             logger.debug("Stealth mode enabled - automation indicators hidden")
+        
+        # Override page visibility to prevent rendering pause when window is in background/minimized
+        # This is critical for background operation - without this, Perplexity pauses rendering
+        self.context.add_init_script("""
+            // Override document visibility properties to always appear visible
+            // This prevents Perplexity from pausing rendering when window is minimized/background
+            Object.defineProperty(document, 'hidden', {
+                get: () => false,
+                configurable: true
+            });
+            
+            Object.defineProperty(document, 'visibilityState', {
+                get: () => 'visible',
+                configurable: true
+            });
+            
+            Object.defineProperty(document, 'webkitHidden', {
+                get: () => false,
+                configurable: true
+            });
+            
+            // Also override Page Visibility API events to prevent detection
+            const visibilityChangeEvent = new Event('visibilitychange');
+            Object.defineProperty(visibilityChangeEvent, 'target', {
+                get: () => document
+            });
+        """)
+        logger.debug("Page visibility override enabled - rendering will continue in background/minimized mode")
 
         # Enable network debugging if requested
         if debug_network:
@@ -737,12 +743,9 @@ class PerplexityWebDriver:
 
         aria_label = mode_labels[mode]
 
-        # Bring page to front for better reliability
-        try:
-            target_page.bring_to_front()
-            target_page.wait_for_timeout(100)
-        except Exception:
-            pass
+        # Bring page to front for better reliability (safe for background/minimized windows)
+        self._safe_bring_to_front(target_page)
+        target_page.wait_for_timeout(100)
 
         # Primary selectors (most reliable first)
         selectors = [
@@ -857,108 +860,157 @@ class PerplexityWebDriver:
         if not search_box:
             raise Exception("Could not find search input. Make sure you're logged in.")
 
-        # Bring page to front to ensure it receives focus (fixes issue when window isn't foreground)
-        try:
-            target_page.bring_to_front()
-            target_page.wait_for_timeout(100)
-        except Exception:
-            pass  # Continue even if bring_to_front fails
+        # Bring page to front to ensure it receives focus (safe for background/minimized windows)
+        # Note: With visibility override, this is less critical but helps with focus
+        self._safe_bring_to_front(target_page)
+        target_page.wait_for_timeout(100)
 
         # Clear any existing text and enter query
-        # Use Playwright's fill() method which works well with contenteditable divs
-        try:
-            # Focus using JavaScript (more reliable than click when window isn't focused)
-            target_page.evaluate("""
-                () => {
-                    const el = document.querySelector('#ask-input') ||
-                              document.querySelector('[contenteditable="true"]');
-                    if (el) {
-                        el.focus();
-                        el.click();  // Ensure it's focused
-                    }
-                }
-            """)
-            target_page.wait_for_timeout(200)
-
-            # Use fill() method - works with contenteditable divs
-            search_box.fill(query)
-
-            # Wait longer to ensure input is processed and looks more human
-            target_page.wait_for_timeout(500)
-
-        except Exception as e:
-            # Fallback: try type() method if fill() fails
+        # HYBRID APPROACH: Try Playwright first (faster when window focused), fallback to JavaScript
+        input_success = False
+        
+        # Method 1: Try Playwright's fill() - works best when window is focused
+        if not self._is_headless:
             try:
-                target_page.keyboard.press("Control+A")  # Select all
-                target_page.wait_for_timeout(50)
-                search_box.type(query, delay=10)
-                target_page.wait_for_timeout(100)
-            except Exception:
-                # Last resort: JavaScript method
-                try:
-                    target_page.evaluate(
-                        """
-                        (query) => {
-                            const el = document.querySelector('#ask-input') ||
-                                      document.querySelector('[contenteditable="true"]');
-                        if (el) {
-                            el.focus();
-                                const p = el.querySelector('p');
-                                if (p) {
-                                    p.textContent = query;
-                                } else {
-                            el.textContent = query;
-                                }
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                                el.dispatchEvent(new Event('change', { bubbles: true }));
-                            }
+                logger.debug("Trying Playwright fill() method")
+                search_box.fill(query)
+                target_page.wait_for_timeout(500)
+                input_success = True
+                logger.debug("✓ Playwright fill() succeeded")
+            except Exception as e:
+                logger.debug(f"Playwright fill() failed (window may be minimized): {e}")
+        
+        # Method 2: Fallback to JavaScript - works even when minimized/background
+        if not input_success:
+            try:
+                logger.debug("Trying JavaScript input method")
+                success = target_page.evaluate(
+                    """
+                    (query) => {
+                        const el = document.querySelector('#ask-input') ||
+                                  document.querySelector('[contenteditable="true"]');
+                        if (!el) return false;
+                        
+                        // Focus element first
+                        el.focus();
+                        
+                        // Clear existing content
+                        el.textContent = '';
+                        const p = el.querySelector('p');
+                        if (p) {
+                            p.textContent = '';
                         }
-                    """,
-                        query,
-                    )
-                    target_page.wait_for_timeout(100)
-                except Exception:
-                    raise Exception(f"Failed to enter query into search box: {str(e)}")
+                        
+                        // Set new content
+                        if (p) {
+                            p.textContent = query;
+                        } else {
+                            el.textContent = query;
+                        }
+                        
+                        // Dispatch input events to trigger Perplexity's event listeners
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+                        
+                        return true;
+                    }
+                """,
+                    query,
+                )
+                
+                if not success:
+                    raise Exception("JavaScript could not find search input element")
+                
+                target_page.wait_for_timeout(500)
+                input_success = True
+                logger.debug("✓ JavaScript input succeeded")
+                
+            except Exception as e:
+                logger.error(f"JavaScript input method also failed: {e}")
+        
+        if not input_success:
+            raise Exception("Failed to enter query - all input methods failed")
 
-        # Submit - try clicking submit button first, fallback to Enter
+        # Submit - HYBRID APPROACH: Try Playwright first, fallback to JavaScript
         # Add a small delay before submitting to look more human
         target_page.wait_for_timeout(300)
 
-        try:
-            # Look for submit button
-            submit_button = target_page.query_selector(
-                'button[data-testid="submit-button"], button:has-text("Submit")'
-            )
-            if submit_button and submit_button.is_visible():
-                # Use JavaScript click for better reliability when window isn't focused
-                submit_button.evaluate("el => el.click()")
-            else:
-                # Fallback: press Enter using JavaScript (more reliable)
-                target_page.evaluate("""
-                    () => {
-                        const el = document.querySelector('#ask-input') ||
-                                  document.querySelector('[contenteditable="true"]');
-                        if (el) {
-                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-                            el.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
-                        }
-                    }
-                """)
-        except Exception:
-            # Last resort: try Playwright's Enter key
+        submit_success = False
+        
+        # Method 1: Try Playwright press Enter - works best when window is focused
+        if not self._is_headless:
             try:
+                logger.debug("Trying Playwright Enter key method")
                 search_box.press("Enter")
-            except Exception:
-                # Final fallback: JavaScript Enter
-                target_page.evaluate("""
+                submit_success = True
+                logger.debug("✓ Playwright Enter succeeded")
+            except Exception as e:
+                logger.debug(f"Playwright Enter failed (window may be minimized): {e}")
+        
+        # Method 2: Fallback to JavaScript - works even when minimized/background
+        if not submit_success:
+            try:
+                logger.debug("Trying JavaScript submit method")
+                js_success = target_page.evaluate("""
                     () => {
+                        // Try to find and click submit button first
+                        const submitButton = document.querySelector('button[data-testid="submit-button"]') ||
+                                            document.querySelector('button[aria-label*="Submit"]');
+                        
+                        if (submitButton) {
+                            submitButton.click();
+                            return true;
+                        }
+                        
+                        // Fallback: Send Enter key to input field
                         const el = document.querySelector('#ask-input') ||
                                   document.querySelector('[contenteditable="true"]');
+                        
                         if (el) {
-                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+                            // Dispatch Enter key events
+                            el.dispatchEvent(new KeyboardEvent('keydown', { 
+                                key: 'Enter', 
+                                code: 'Enter', 
+                                keyCode: 13, 
+                                which: 13,
+                                bubbles: true,
+                                cancelable: true
+                            }));
+                            el.dispatchEvent(new KeyboardEvent('keypress', { 
+                                key: 'Enter', 
+                                code: 'Enter', 
+                                keyCode: 13,
+                                which: 13, 
+                                bubbles: true,
+                                cancelable: true
+                            }));
+                            el.dispatchEvent(new KeyboardEvent('keyup', { 
+                                key: 'Enter', 
+                                code: 'Enter', 
+                                keyCode: 13,
+                                which: 13, 
+                                bubbles: true,
+                                cancelable: true
+                            }));
+                            return true;
                         }
+                        
+                        return false;
                     }
                 """)
+                
+                if not js_success:
+                    raise Exception("JavaScript could not submit query")
+                
+                submit_success = True
+                logger.debug("✓ JavaScript submit succeeded")
+                
+            except Exception as e:
+                logger.error(f"JavaScript submit method also failed: {e}")
+        
+        if not submit_success:
+            raise Exception("Failed to submit search query - all methods failed")
 
         # Wait a moment after submitting before checking for response
         target_page.wait_for_timeout(1000)  # Wait 1 second after submit
@@ -1060,14 +1112,11 @@ class PerplexityWebDriver:
             while (time.time() - start_time) < max_wait_time:
                 try:
                     # Bring page to front periodically to ensure rendering continues
-                    # Perplexity pauses rendering when window is in background
+                    # With visibility override, this should work even when minimized/background
                     current_time = time.time()
                     if current_time - last_bring_to_front > 5:  # Every 5 seconds
-                        try:
-                            target_page.bring_to_front()
-                            last_bring_to_front = current_time
-                        except Exception:
-                            pass
+                        self._safe_bring_to_front(target_page)
+                        last_bring_to_front = current_time
 
                     current_url = target_page.url
                     if "perplexity.ai" not in current_url.lower():
@@ -1192,19 +1241,13 @@ class PerplexityWebDriver:
                             answer_complete = False
                             if has_content:
                                 logger.debug("Found content while generating")
-                            # Ensure page is in foreground while generating
-                            try:
-                                target_page.bring_to_front()
-                            except Exception:
-                                pass
+                            # Ensure page is in foreground while generating (safe for background)
+                            self._safe_bring_to_front(target_page)
                         else:
                             # No buttons yet, might be initial loading
                             answer_complete = False
-                            # Bring to front to ensure rendering starts
-                            try:
-                                target_page.bring_to_front()
-                            except Exception:
-                                pass
+                            # Bring to front to ensure rendering starts (safe for background)
+                            self._safe_bring_to_front(target_page)
 
                     except Exception as e:
                         logger.debug(f"Page state check error: {str(e)[:100]}")
@@ -2491,12 +2534,9 @@ class PerplexityWebDriver:
 
         logger.info("Starting export with improved detection...")
 
-        # Ensure page is active
-        try:
-            target_page.bring_to_front()
-            target_page.wait_for_timeout(1000)
-        except Exception:
-            pass
+        # Ensure page is active (safe for background/minimized windows)
+        self._safe_bring_to_front(target_page)
+        target_page.wait_for_timeout(1000)
 
         # Setup output directory
         output_dir = Path(output_dir) if output_dir else Path.cwd() / "exports"
@@ -2513,135 +2553,118 @@ class PerplexityWebDriver:
             # Wait for page to settle after search completion
             target_page.wait_for_timeout(2000)
 
-            # Multiple selectors for thread actions button
-            button_selectors = [
-                'button[aria-label="Thread actions"]',
-                'button[title="Thread actions"]',
-                'button:has-text("Thread actions")',
-                '[data-testid="thread-actions"]',
-                'button:has([aria-label*="more"])',
-                'button:has([aria-label*="options"])',
-                'button[aria-label*="menu"]',
-            ]
+            # Use JavaScript to find and click thread actions button (works in background)
+            thread_button_clicked = target_page.evaluate("""
+                () => {
+                    // Try multiple selectors
+                    const selectors = [
+                        'button[aria-label="Thread actions"]',
+                        'button[title="Thread actions"]',
+                        '[data-testid="thread-actions"]',
+                        'button[aria-label*="menu"]'
+                    ];
+                    
+                    for (const selector of selectors) {
+                        const buttons = document.querySelectorAll(selector);
+                        for (const btn of buttons) {
+                            // Check if element exists in DOM (don't check visibility for background operation)
+                            if (btn && btn.offsetParent !== null) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                    }
+                    
+                    return false;
+                }
+            """)
 
-            thread_button = None
-            for selector in button_selectors:
+            if thread_button_clicked:
+                logger.debug("Thread actions button clicked via JavaScript")
+                # Wait longer for menu to fully render (especially when minimized)
+                target_page.wait_for_timeout(2000)
+
+                # Look for and click export option using JavaScript (works in background)
                 try:
-                    buttons = target_page.query_selector_all(selector)
-                    for btn in buttons:
-                        if btn.is_visible():
-                            thread_button = btn
-                            logger.debug(
-                                f"Found thread actions button with selector: {selector}"
-                            )
-                            break
-                    if thread_button:
-                        break
-                except Exception:
-                    continue
+                    # Set up download listener before clicking
+                    with target_page.expect_download(timeout=10000) as download_info:  # Reduced from 30s to 10s
+                        # Click export button via JavaScript with better detection
+                        export_clicked = target_page.evaluate("""
+                            () => {
+                                // Wait a moment for menu animation to complete
+                                return new Promise((resolve) => {
+                                    setTimeout(() => {
+                                        // Try to find export/markdown button by checking text content
+                                        const allElements = document.querySelectorAll('button, a, [role="menuitem"], div[role="button"]');
+                                        
+                                        for (const elem of allElements) {
+                                            const text = (elem.innerText || elem.textContent || '').toLowerCase().trim();
+                                            
+                                            // Check if it's an export/markdown button (more flexible matching)
+                                            if (text.includes('export') || text.includes('markdown') || 
+                                                text.includes('download')) {
+                                                // Check if it's the markdown export specifically
+                                                if (text.includes('markdown') || 
+                                                    elem.getAttribute('aria-label')?.toLowerCase().includes('markdown')) {
+                                                    console.log('[EXPORT] Found export button:', text);
+                                                    elem.click();
+                                                    resolve(true);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Try attribute-based selectors as fallback
+                                        const attrSelectors = [
+                                            '[data-testid*="export"]',
+                                            '[data-testid*="markdown"]',
+                                            '[aria-label*="export"]',
+                                            '[aria-label*="markdown"]'
+                                        ];
+                                        
+                                        for (const selector of attrSelectors) {
+                                            const elems = document.querySelectorAll(selector);
+                                            for (const elem of elems) {
+                                                const text = (elem.innerText || elem.textContent || '').toLowerCase();
+                                                const ariaLabel = elem.getAttribute('aria-label')?.toLowerCase() || '';
+                                                if (text.includes('markdown') || ariaLabel.includes('markdown')) {
+                                                    console.log('[EXPORT] Found via selector:', selector);
+                                                    elem.click();
+                                                    resolve(true);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        
+                                        console.log('[EXPORT] Export button not found');
+                                        resolve(false);
+                                    }, 500); // Wait 500ms for menu to render
+                                });
+                            }
+                        """)
+                        
+                        if not export_clicked:
+                            raise Exception("Export button not found after menu opened")
 
-            if thread_button:
-                # Click the button
-                thread_button.click()
-                target_page.wait_for_timeout(1000)
-
-                # Look for export options with multiple approaches
-                export_selectors = [
-                    # Text-based selectors
-                    'button:has-text("Export as Markdown")',
-                    'button:has-text("Export Markdown")',
-                    'button:has-text("Download Markdown")',
-                    'a:has-text("Export as Markdown")',
-                    'a:has-text("Export Markdown")',
-                    '[role="menuitem"]:has-text("Export")',
-                    '[role="menuitem"]:has-text("Markdown")',
-                    # Attribute-based selectors
-                    '[data-testid*="export"]',
-                    '[data-testid*="markdown"]',
-                    '[aria-label*="export"]',
-                    '[aria-label*="markdown"]',
-                ]
-
-                export_element = None
-                for selector in export_selectors:
-                    try:
-                        elements = target_page.query_selector_all(selector)
-                        for elem in elements:
-                            if elem.is_visible():
-                                text = elem.inner_text().lower()
-                                if any(
-                                    word in text
-                                    for word in ["export", "markdown", "download"]
-                                ):
-                                    export_element = elem
-                                    logger.debug(
-                                        f"Found export element with selector: {selector}"
-                                    )
-                                    break
-                        if export_element:
-                            break
-                    except Exception:
-                        continue
-
-                if export_element:
-                    try:
-                        with target_page.expect_download(
-                            timeout=30000
-                        ) as download_info:
-                            export_element.click()
-
-                        download = download_info.value
-                        download.save_as(export_path)
-                        logger.info(
-                            f"Successfully exported via Strategy 1: {export_path}"
-                        )
-                        return export_path
-                    except Exception as e:
-                        logger.debug(f"Download failed in Strategy 1: {e}")
+                    download = download_info.value
+                    download.save_as(export_path)
+                    logger.info(
+                        f"Successfully exported via Strategy 1: {export_path}"
+                    )
+                    return export_path
+                except Exception as e:
+                    logger.debug(f"Download failed in Strategy 1: {e}")
 
         except Exception as e:
             logger.debug(f"Strategy 1 failed: {e}")
 
-        # Strategy 2: Try keyboard shortcuts
-        try:
-            logger.debug("Strategy 2: Trying keyboard shortcuts...")
+        # Strategy 2 (keyboard shortcuts) - REMOVED (doesn't work reliably)
+        # Perplexity doesn't have standard export keyboard shortcuts
 
-            # Close any open menus first
-            target_page.keyboard.press("Escape")
-            target_page.wait_for_timeout(500)
-
-            # Common export shortcuts
-            shortcuts = ["Control+Shift+E", "Control+E", "Control+S", "Control+Shift+S"]
-
-            for shortcut in shortcuts:
-                try:
-                    target_page.keyboard.press(shortcut)
-                    target_page.wait_for_timeout(1000)
-
-                    # Check if download started
-                    with target_page.expect_download(timeout=3000) as download_info:
-                        pass
-
-                    download = download_info.value
-                    if (
-                        download.suggested_filename
-                        and ".md" in download.suggested_filename
-                    ):
-                        download.save_as(export_path)
-                        logger.info(
-                            f"Successfully exported via keyboard shortcut {shortcut}: {export_path}"
-                        )
-                        return export_path
-                except Exception:
-                    continue
-
-        except Exception as e:
-            logger.debug(f"Strategy 2 failed: {e}")
-
-        # Strategy 3: Manual content extraction with improved formatting
+        # Strategy 2: Manual content extraction with improved formatting (was Strategy 3)
         try:
             logger.debug(
-                "Strategy 3: Manual content extraction with improved formatting..."
+                "Strategy 2: Manual content extraction with improved formatting..."
             )
 
             # Use the improved get_response_text method for better content extraction
@@ -2784,7 +2807,7 @@ The conversation should be visible in your browser window.
         )
 
     def close(self) -> None:
-        """Close browser and cleanup - suppress all errors"""
+        """Close browser and cleanup - suppress all errors including EPIPE"""
         # Suppress warnings and stderr output during cleanup
         import os
         import sys
@@ -2792,10 +2815,20 @@ The conversation should be visible in your browser window.
 
         warnings.filterwarnings("ignore")
 
+        # Small delay to let browser finish any pending operations
+        # This reduces EPIPE errors during cleanup
+        try:
+            import time
+            time.sleep(0.3)  # 300ms delay
+        except Exception:
+            pass
+
         # Redirect stderr to devnull to suppress Playwright/Camoufox cleanup errors
         old_stderr = sys.stderr
+        devnull_file = None
         try:
-            sys.stderr = open(os.devnull, "w")
+            devnull_file = open(os.devnull, "w")
+            sys.stderr = devnull_file
         except Exception:
             pass
 
@@ -2856,10 +2889,10 @@ The conversation should be visible in your browser window.
         except Exception:
             pass
         finally:
-            # Restore stderr
+            # Restore stderr and close devnull file
             try:
-                if sys.stderr != old_stderr:
-                    sys.stderr.close()
                 sys.stderr = old_stderr
+                if devnull_file:
+                    devnull_file.close()
             except Exception:
                 pass
